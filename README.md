@@ -1,6 +1,6 @@
 # Decision Lens — анализ изменений СПР, проверки и отчёты
 
-Локальное приложение на C++20 (Drogon, simdjson), PostgreSQL 16, React + TypeScript, TanStack Query и Monaco. Стандартные этапы выполняются C++; редактируемые Python-процедуры — отдельным изолированным worker. Целевая ОС: **Ubuntu 24.04 в WSL2 либо Linux**, компилятор **g++**. Windows/MinGW-сборка не используется.
+Локальное приложение на C++20 (Drogon, simdjson), PostgreSQL 16, React + TypeScript, TanStack Query и Monaco. Стандартные этапы выполняются C++; редактируемые Python-процедуры — отдельным изолированным worker. Целевая ОС: **Ubuntu 24.04,  Linux**, компилятор **g++**.
 
 ## Запуск в WSL2
 
