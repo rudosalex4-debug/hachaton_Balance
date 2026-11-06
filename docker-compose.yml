@@ -1,0 +1,81 @@
+name: decision-lens
+services:
+  postgres:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_USER: lens
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lens-local-development}
+      POSTGRES_DB: lens
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U lens -d lens"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  python-worker:
+    build:
+      context: .
+      dockerfile: python-worker/Dockerfile
+    environment:
+      JOBS_ROOT: /jobs
+    volumes:
+      - jobs:/jobs
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 3g
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://lens:${POSTGRES_PASSWORD:-lens-local-development}@postgres:5432/lens
+      DATA_ROOT: /data
+      UPLOAD_ROOT: /uploads
+      JOBS_ROOT: /jobs
+      MIGRATIONS_PATH: /app/database/migrations/001_init.sql
+    volumes:
+      - ${DATA_DIR:-./data}:/data:ro
+      - uploads:/uploads
+      - jobs:/jobs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      python-worker:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 4g
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:8080/health]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:${APP_PORT:-8088}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  uploads:
+  jobs:
+

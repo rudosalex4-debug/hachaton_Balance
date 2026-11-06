@@ -1,0 +1,34 @@
+{
+  "cpp_tests_passed": 29,
+  "worker_tests_passed": 18,
+  "frontend_build": "passed",
+  "browser_smoke": "passed with mocked API",
+  "integration_api": "passed",
+  "python_aggregate": {
+    "input_bytes": 418638918,
+    "memory_limit_mib": 1024,
+    "matched_facts": 44588,
+    "verification_seconds": 93.099
+  },
+  "full_run_linux_data": {
+    "changed_apps": 502,
+    "changed_rows": 14412,
+    "comparison_rows": 289533,
+    "decision_changed": 385,
+    "facts": 44588,
+    "normalized_rows": 572221,
+    "rows": 289533,
+    "timings": {
+      "aggregate_seconds": 108.441863396,
+      "compare_seconds": 93.440712363,
+      "normalize_seconds": 109.10914614200001,
+      "read_seconds": 1.456682775,
+      "segments_seconds": 10.162037640999985,
+      "storage_seconds": 183.17975380299998
+    },
+    "total_apps": 2002,
+    "total_seconds": 322.82009592
+  },
+  "performance_target_30s_met": false,
+  "performance_minimum_300s_met": false
+}

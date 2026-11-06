@@ -1,0 +1,44 @@
+[
+  {
+    "file": "check_ar_drop_by_product.py",
+    "label": "Approval Rate по продукту упал",
+    "params": {
+      "max_drop_rel": 0.1,
+      "low_confidence_cnt": 5,
+      "app_ids_limit": 20
+    }
+  },
+  {
+    "file": "check_attribute_new_loss.py",
+    "label": "Изменился состав атрибутов",
+    "params": {
+      "min_share": 0.001,
+      "low_confidence_cnt": 5,
+      "app_ids_limit": 20
+    }
+  },
+  {
+    "file": "check_external_score_drift.py",
+    "label": "Различие вызвано входными данными",
+    "params": {
+      "low_confidence_cnt": 5,
+      "app_ids_limit": 20
+    }
+  },
+  {
+    "file": "check_stop_factor_disappeared.py",
+    "label": "Стоп-фактор перестал работать",
+    "params": {
+      "low_confidence_cnt": 5,
+      "app_ids_limit": 20
+    }
+  },
+  {
+    "file": "check_target_model_changed.py",
+    "label": "Сменилась целевая модель решения",
+    "params": {
+      "low_confidence_cnt": 5,
+      "app_ids_limit": 20
+    }
+  }
+]

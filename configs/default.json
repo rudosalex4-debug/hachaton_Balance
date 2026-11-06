@@ -1,0 +1,113 @@
+{
+  "exclude_paths": [
+    "appData.request_id",
+    "appData.createDateTime"
+  ],
+  "array_rules": {
+    "decisionResult.available_offers": {
+      "mode": "field",
+      "fields": [
+        "product_id",
+        "type"
+      ]
+    },
+    "decisionResult.product_trials": {
+      "mode": "field",
+      "fields": [
+        "product_id"
+      ]
+    },
+    "decisionResult.product_trials.rules": {
+      "mode": "field",
+      "fields": [
+        "name"
+      ]
+    },
+    "decisionResult.product_trials.scoring.scoreModels": {
+      "mode": "field",
+      "fields": [
+        "modelName"
+      ]
+    },
+    "decisionResult.scoring": {
+      "mode": "field",
+      "fields": [
+        "modelName"
+      ]
+    },
+    "decisionResult.scoring.value": {
+      "mode": "index"
+    },
+    "ext_data": {
+      "mode": "field",
+      "fields": [
+        "body.action"
+      ]
+    },
+    "product_catalog": {
+      "mode": "field",
+      "fields": [
+        "mfo_id",
+        "product_id"
+      ]
+    },
+    "tariff_matrix": {
+      "mode": "field",
+      "fields": [
+        "mfo_id",
+        "product_id"
+      ]
+    }
+  },
+  "bucket_rules": {
+    "*.value": [
+      0,
+      0.3,
+      0.6,
+      1
+    ],
+    "*.features.sumActiveDeals": [
+      0,
+      10000,
+      50000,
+      100000,
+      250000,
+      1000000
+    ],
+    "*score_okb": [
+      0,
+      400,
+      600,
+      700,
+      800,
+      1000
+    ],
+    "*score_equ": [
+      0,
+      400,
+      600,
+      700,
+      800,
+      1000
+    ]
+  },
+  "aggregate_dimensions": [
+    "PREFIX",
+    "CLASS",
+    "SUFFIX",
+    "ARRAY_KEY",
+    "KEY",
+    "PATH",
+    "VALUE_ADJUSTED",
+    "SOURCE",
+    "DIFF_FLAG",
+    "CHANGE_TYPE",
+    "PRODUCTS",
+    "PARTNER_TYPE",
+    "ROUTING_METHOD",
+    "DECISION_CHANGED"
+  ],
+  "max_json_bytes": 10485760,
+  "max_rows_per_app": 10000,
+  "max_depth": 256
+}
