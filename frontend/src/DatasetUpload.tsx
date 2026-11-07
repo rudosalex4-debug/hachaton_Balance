@@ -65,7 +65,7 @@ export default function DatasetUpload() {
           if (!name && items.length) setName(items[0].webkitRelativePath.split('/')[0]);
         }}/><span className="help">JSON, XML или CSV в UTF-8. До 8 МиБ на файл и 48 МиБ на набор.</span></label>
       </div>
-      {!!files.length && <p className="tiny muted">Файлов к загрузке — {numeric(files.length)} · {numeric(bytes / MiB)} МиБ</p>}
+      {!!files.length && <p className="tiny muted">Файлов к загрузке: {numeric(files.length)} | {numeric(bytes / MiB)} МиБ</p>}
       {mutation.error && <div role="alert" className="error-box">{mutation.error.message}</div>}
       {mutation.isSuccess && <p role="status" className="inline-status">Набор загружен и проверен. Его можно выбрать в конфигурации запуска.</p>}
       <button disabled={!files.length || mutation.isPending}>{mutation.isPending

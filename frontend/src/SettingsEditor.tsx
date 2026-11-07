@@ -10,7 +10,7 @@ export default function SettingsEditor({initial}:{initial:Row}) {
  let config:Row={};let parseError='';
  try {config=JSON.parse(text);if(!config||Array.isArray(config)||typeof config!=='object')throw Error('Ожидается JSON-объект.');}
  catch {parseError='Исправьте JSON ниже, чтобы продолжить настройку.';config={};}
- if(!parseError&&(!Array.isArray(config.exclude_paths||[])||!Array.isArray(config.aggregate_dimensions||[])||typeof (config.array_rules||{})!=='object'||Object.values(config.array_rules||{}).some((rule:any)=>!rule||typeof rule!=='object'||!Array.isArray(rule.fields||[]))||typeof (config.bucket_rules||{})!=='object')){parseError='Проверьте структуру настроек: пути и измерения — списки, правила — объекты.';config={};}
+ if(!parseError&&(!Array.isArray(config.exclude_paths||[])||!Array.isArray(config.aggregate_dimensions||[])||typeof (config.array_rules||{})!=='object'||Object.values(config.array_rules||{}).some((rule:any)=>!rule||typeof rule!=='object'||!Array.isArray(rule.fields||[]))||typeof (config.bucket_rules||{})!=='object')){parseError='Проверьте структуру настроек: пути и измерения - списки, правила - объекты.';config={};}
  const update=(patch:Row)=>setText(JSON.stringify({...config,...patch},null,2));
  const arrays=Object.entries(config.array_rules||{}) as [string,Row][];
  const buckets=Object.entries(config.bucket_rules||{}) as [string,unknown][];
