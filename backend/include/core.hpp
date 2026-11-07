@@ -1,6 +1,7 @@
 #pragma once
 #include <json/json.h>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -35,12 +36,22 @@ Json::Value normalize(const std::string& raw, const std::string& appId,
                       const std::string& source, const Json::Value& config);
 Json::Value compare(const Json::Value& beforeRows, const Json::Value& afterRows,
                     const Json::Value& config);
+// Fast path for a single application's two canonical, sorted normalize() outputs.
+Json::Value compareNormalizedPair(const Json::Value& beforeRows, const Json::Value& afterRows);
 Json::Value segments(const std::string& beforeRaw, const std::string& afterRaw,
                      const std::string& appId, const Json::Value& config = defaultConfig());
 // Reuse already normalized native rows; inputs must contain one application's
 // BEFORE/AFTER rows. This avoids parsing the same documents a second time.
 Json::Value segmentsFromNormalized(const Json::Value& beforeRows, const Json::Value& afterRows,
                                   const std::string& appId);
+// comparisons must be the output of compare(beforeRows, afterRows) for this application.
+Json::Value segmentsFromNormalized(const Json::Value& beforeRows, const Json::Value& afterRows,
+                                   const std::string& appId, const Json::Value& comparisons);
+using ComparisonBatch = std::function<void(const Json::Value&)>;
+using ComparisonSource = std::function<void(const ComparisonBatch&)>;
+// The database source yields disjoint rows with unique comparison identities.
+Json::Value aggregateBatches(const ComparisonSource& produce, const Json::Value& segments,
+                             const Json::Value& config);
 Json::Value aggregate(const Json::Value& comparisons, const Json::Value& segments,
                       const Json::Value& config);
 void validateNormalized(const Json::Value& rows, const std::string& appId = "", const std::string& source = "");

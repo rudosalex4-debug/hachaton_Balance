@@ -9,6 +9,19 @@ namespace lens {
 std::string encode(const Json::Value&);
 Json::Value decode(const std::string&);
 std::string timestamp();
+struct CopyProfileState;
+// Scope on the thread that owns a single run. Nested scopes restore the
+// caller's metrics, including after exceptions.
+class CopyProfile {
+    std::unique_ptr<CopyProfileState> state_;
+    CopyProfileState* previous_;
+public:
+    explicit CopyProfile(bool enabled);
+    ~CopyProfile();
+    CopyProfile(const CopyProfile&) = delete;
+    CopyProfile& operator=(const CopyProfile&) = delete;
+    Json::Value report() const;
+};
 struct HttpError : std::runtime_error { int status; HttpError(int s,const std::string& m):std::runtime_error(m),status(s){} };
 class Storage {
  std::string connectionString_;
@@ -27,7 +40,7 @@ class Storage {
  void saveChecks(const std::string& run,const Json::Value& rows);
  Json::Value checkPage(const std::string& run,const std::map<std::string,std::string>& filters,int offset,int limit) const;
  Json::Value checkSummary(const std::string& run) const;
- void facts(const std::string& run,const Json::Value& values);
+ void facts(const std::string& run,Json::Value& values);
  Json::Value page(const std::string& run,const std::string& type,const std::map<std::string,std::string>& filters,int offset,int limit) const;
  Json::Value factApps(const std::string& run,const std::string& fact,int offset,int limit) const;
  Json::Value application(const std::string& run,const std::string& id,int offset=0,int limit=1000) const;

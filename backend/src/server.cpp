@@ -1,4 +1,5 @@
 #include "storage.hpp"
+#include "pipeline_profile.hpp"
 #include "core.hpp"
 #include "stage_executor.hpp"
 #include "reports.hpp"
@@ -26,6 +27,7 @@
 #include <algorithm>
 #include <iostream>
 #include <tuple>
+#include <string_view>
 
 namespace fs=std::filesystem;
 using lens::Storage; using lens::HttpError;
@@ -41,6 +43,7 @@ struct Pair {std::string id,before,after;};
 
 struct DatasetInput {
  std::vector<Pair> pairs;
+ size_t applicationCount = 0;
  Json::Value contract;
  Json::Value formats{Json::objectValue};
  std::string digest;
@@ -90,7 +93,7 @@ static std::map<std::string, InputFile> scanSide(const fs::path& root, const cha
  return files;
 }
 
-static DatasetInput inspectDataset(const std::string& path, const std::function<bool()>& cancelled = [] { return false; }) {
+static DatasetInput inspectDataset(const std::string& path, const std::function<bool()>& cancelled = [] { return false; }, bool retainDocuments = false) {
  auto root = fs::canonical(path);
  auto allowed = fs::weakly_canonical(env("DATA_ROOT", "/data"));
  auto uploads = fs::weakly_canonical(env("UPLOAD_ROOT", "/uploads"));
@@ -108,12 +111,18 @@ static DatasetInput inspectDataset(const std::string& path, const std::function<
 
  DatasetInput dataset;
  dataset.contract = inputContract(manifest);
- dataset.pairs.reserve(before.size());
+ dataset.applicationCount = before.size();
+ if (retainDocuments) dataset.pairs.reserve(before.size());
  const auto& profiles = static_cast<const Json::Value&>(dataset.contract)["profiles"];
+ const Json::Value emptyProfile(Json::objectValue);
  std::string signatures, formatSequence;
  size_t sourceBytes = 0, mappedBytes = 0;
  auto readDocument = [&](const InputFile& file, const std::string& id) {
-  auto raw = readFile(file.path);
+  std::string raw;
+  {
+   lens::OperationTimer timer(&lens::PipelineProfile::inputRead);
+   raw = readFile(file.path);
+  }
   sourceBytes += raw.size();
   if (sourceBytes > 512ULL * 1024 * 1024) throw HttpError(400, "Dataset exceeds 512 MiB");
   signatures += ":" + hash(raw);
@@ -121,10 +130,19 @@ static DatasetInput inspectDataset(const std::string& path, const std::function<
   auto& count = dataset.formats[file.format];
   count = count.asUInt() + 1;
   try {
-   auto document = lens::readInputDocument(file.format, raw, profiles.get(file.format, Json::Value(Json::objectValue)));
+   std::string document;
+   {
+    lens::OperationTimer timer(&lens::PipelineProfile::inputMapping);
+    document = lens::readInputDocument(file.format, raw, profiles.isMember(file.format) ? profiles[file.format] : emptyProfile);
+   }
    mappedBytes += document.size();
    if (document.size() > 8ULL * 1024 * 1024 || mappedBytes > 512ULL * 1024 * 1024)
     throw std::runtime_error("Mapped document or dataset exceeds size limit");
+   if (auto* profile = lens::PipelineProfile::active) {
+    profile->inputBytes += raw.size();
+    profile->mappedBytes += document.size();
+   }
+   lens::OperationTimer timer(&lens::PipelineProfile::idValidation);
    const auto value = lens::decode(document);
    if (!value.isObject() || value["appData"]["application_id"].asString() != id)
     throw std::runtime_error("Filename / application_id mismatch: " + id);
@@ -141,7 +159,7 @@ static DatasetInput inspectDataset(const std::string& path, const std::function<
   auto first = readDocument(file, id);
   auto second = readDocument(match->second, id);
   signatures += "\n";
-  dataset.pairs.push_back({id, std::move(first), std::move(second)});
+  if (retainDocuments) dataset.pairs.push_back({id, std::move(first), std::move(second)});
  }
  if (!profiles.empty() || dataset.formats.size() != 1 || !dataset.formats.isMember("json"))
   signatures += lens::encode(dataset.contract) + "\n" + formatSequence;
@@ -151,6 +169,36 @@ static DatasetInput inspectDataset(const std::string& path, const std::function<
 static Json::Value array(){return Json::Value(Json::arrayValue);}
 static void extend(Json::Value& a,const Json::Value& b){for(const auto& v:b)a.append(v);}
 static Json::Value selectRows(Storage& db,const std::string& run,const std::string& table,const std::vector<std::string>& ids={}){if(table!="normalized_values"&&table!="comparison_values"&&table!="application_segments")throw std::runtime_error("Invalid table");auto c=db.connection();pqxx::read_transaction tx(*c);std::string sql="SELECT data FROM "+table+" WHERE run_id="+tx.quote(run);if(!ids.empty()){sql+=" AND app_id IN (";bool first=true;for(auto& id:ids){if(!first)sql+=",";first=false;sql+=tx.quote(id);}sql+=")";}sql+=" ORDER BY app_id";Json::Value out=array();for(auto row:tx.exec(sql))out.append(lens::decode(row[0].as<std::string>()));return out;}
+// The unique database key spans the cursor batches. A single cursor preserves
+// the run snapshot without loading the whole result into libpq and JsonCpp.
+// aggregateBatches orders its output, so a SQL sort here would repeat that work.
+static void visitComparisons(Storage& db, const std::string& run, const lens::ComparisonBatch& accept,
+                             const std::function<void()>& check) {
+ auto connection = db.connection();
+ pqxx::read_transaction tx(*connection);
+ tx.exec("DECLARE mart_rows NO SCROLL CURSOR FOR SELECT data FROM comparison_values WHERE run_id=" +
+         tx.quote(run));
+ for (;;) {
+  check();
+  auto records = [&] {
+   lens::OperationTimer timer(&lens::PipelineProfile::martFetch);
+   return tx.exec("FETCH FORWARD 512 FROM mart_rows");
+  }();
+  if (records.empty()) break;
+  Json::Value batch(Json::arrayValue);
+  {
+   lens::OperationTimer timer(&lens::PipelineProfile::martDecode);
+   for (const auto& record : records) {
+    auto text = record[0].as<std::string>();
+    if (auto* profile = lens::PipelineProfile::active) profile->fetchedBytes += text.size();
+    batch.append(lens::decode(text));
+   }
+  }
+  accept(batch);
+ }
+ tx.commit();
+}
+
 static Json::Value stageConfig(const Json::Value& config,const Json::Value& proc){auto result=config;for(auto it=proc["params"].begin();it!=proc["params"].end();++it)result[it.name()]=*it;return result;}
 
 class Jobs {
@@ -160,10 +208,13 @@ class Jobs {
   auto state=[&](const std::string& stage,int progress){check();Json::Value p;p["status"]="running";p["stage"]=stage;p["progress"]=progress;p["elapsed_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();db_.patchRun(id,p);};
   auto invoke=[&](const std::string& kind,const Json::Value& input){auto proc=procedures[kind];return lens::executePython(kind,proc["code"].asString(),input,stageConfig(settings,proc),cancelled,[&](const std::string& line){db_.log(id,kind,line,0,0,proc["id"].asString());});};
   try{
+   const bool profiling = env("LENS_PROFILE", "0") == "1";
+   lens::PipelineProfile pipelineProfile(profiling);
+   lens::CopyProfile copyProfile(profiling);
    state("validating",0);
    db_.log(id,"validating","Validating manifest, input documents and application identifiers");
    const auto& registered = run["snapshot"]["dataset"];
-   auto input = inspectDataset(registered["path"].asString(), cancelled);
+   auto input = inspectDataset(registered["path"].asString(), cancelled, true);
    if (registered.isMember("input_contract") && registered["input_contract"] != input.contract)
     throw std::runtime_error("Input profile changed after registration; register the updated dataset");
    auto& pairs = input.pairs;
@@ -175,23 +226,236 @@ class Jobs {
    db_.patchRun(id, fingerprint);
    phase("read_seconds");
    db_.log(id,"validating","Dataset validated",pairs.size(),pairs.size());
-   Json::Value segs=array();if(procedures["normalize"]["mode"].asString()!="native")for(const auto& p:pairs)segs.append(lens::segments(p.before,p.after,p.id,settings));phase("segments_seconds");
-   state("normalizing",5);db_.log(id,"normalizing","Normalization started",0,pairs.size(),procedures["normalize"]["id"].asString());long normalizedCount=0;constexpr size_t batchSize=100;
-   for(size_t begin=0;begin<pairs.size();begin+=batchSize){check();Json::Value rows=array();size_t end=std::min(begin+batchSize,pairs.size());std::set<std::string> appIds;
-    if(procedures["normalize"]["mode"].asString()=="native"){for(size_t i=begin;i<end;++i){auto& p=pairs[i];auto before=lens::normalize(p.before,p.id,"BEFORE",settings),after=lens::normalize(p.after,p.id,"AFTER",settings);auto segmentStart=std::chrono::steady_clock::now();segs.append(lens::segmentsFromNormalized(before,after,p.id));segmentSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-segmentStart).count();for(auto& row:before)rows.append(std::move(row));for(auto& row:after)rows.append(std::move(row));appIds.insert(p.id);}}
-    else{Json::Value input;input["records"]=array();for(size_t i=begin;i<end;++i){auto& p=pairs[i];appIds.insert(p.id);for(auto source:{"BEFORE","AFTER"}){Json::Value record;record["APP_ID"]=p.id;record["SOURCE"]=source;record["raw"]=std::string(source)=="BEFORE"?p.before:p.after;input["records"].append(record);}}rows=invoke("normalize",input);}
-    lens::validateNormalized(rows);for(auto& r:rows)if(!appIds.count(r["APP_ID"].asString()))throw std::runtime_error("Normalizer returned foreign APP_ID");normalizedCount+=rows.size();Json::Value counters;counters["processed_files"]=Json::UInt64(end*2);counters["normalized_rows"]=Json::Int64(normalizedCount);db_.patchRun(id,counters);persist([&]{db_.append(id,rows,array(),array());});state("normalizing",5+int(40*end/pairs.size()));db_.log(id,"normalizing","Normalized rows: "+std::to_string(normalizedCount),end,pairs.size(),procedures["normalize"]["id"].asString());}
-   phase("normalize_seconds");timings["normalize_seconds"]=timings["normalize_seconds"].asDouble()-segmentSeconds;timings["segments_seconds"]=timings["segments_seconds"].asDouble()+segmentSeconds;db_.log(id,"normalizing","Normalization finished",pairs.size()*2,normalizedCount,procedures["normalize"]["id"].asString());for(auto& p:pairs){p.before.clear();p.after.clear();}
-   state("comparing",46);db_.log(id,"comparing","Comparison started",0,pairs.size(),procedures["compare"]["id"].asString());long comparisonCount=0,changedCount=0;std::set<std::string> changed;
-   for(size_t begin=0;begin<pairs.size();begin+=batchSize){check();size_t end=std::min(begin+batchSize,pairs.size());std::vector<std::string> ids;for(size_t i=begin;i<end;++i)ids.push_back(pairs[i].id);auto flat=selectRows(db_,id,"normalized_values",ids);Json::Value before=array(),after=array(),batchSegments=array();std::set<std::tuple<std::string,std::string,std::string>> expected;for(auto& r:flat){expected.emplace(r["APP_ID"].asString(),r["PATH"].asString(),r["ARRAY_KEY"].asString());auto& destination=r["SOURCE"].asString()=="BEFORE"?before:after;destination.append(std::move(r));}flat.clear();if(procedures["compare"]["mode"].asString()!="native")for(size_t i=begin;i<end;++i)batchSegments.append(segs[Json::ArrayIndex(i)]);Json::Value compared;
-    if(procedures["compare"]["mode"].asString()=="native")compared=lens::compare(before,after,settings);else{Json::Value input;input["before"]=before;input["after"]=after;input["segments"]=batchSegments;auto result=invoke("compare",input);compared=result.isArray()?result:result["rows"];if(result.isObject()&&result["segments"].isArray()&&!result["segments"].empty()){std::map<std::string,Json::Value> replacement;for(auto& s:result["segments"]){auto app=s["APP_ID"].asString();if(std::find(ids.begin(),ids.end(),app)==ids.end()||!replacement.emplace(app,s).second)throw std::runtime_error("Invalid custom segment identity");}if(replacement.size()!=ids.size())throw std::runtime_error("Custom comparison must return every batch segment");for(size_t i=begin;i<end;++i)segs[Json::ArrayIndex(i)]=replacement.at(pairs[i].id);}}
-    lens::validateComparison(compared);std::set<std::tuple<std::string,std::string,std::string>> actual;for(auto& r:compared){actual.emplace(r["APP_ID"].asString(),r["PATH"].asString(),r["ARRAY_KEY"].asString());if(r["DIFF_FLAG"].asInt()){++changedCount;changed.insert(r["APP_ID"].asString());}}if(actual!=expected)throw std::runtime_error("Comparison must preserve the full union of attribute identities");comparisonCount+=compared.size();Json::Value counters;counters["comparison_rows"]=Json::Int64(comparisonCount);counters["changed_rows"]=Json::Int64(changedCount);db_.patchRun(id,counters);persist([&]{db_.append(id,array(),compared,array());});state("comparing",46+int(30*end/pairs.size()));db_.log(id,"comparing","Compared rows: "+std::to_string(comparisonCount),end,pairs.size(),procedures["compare"]["id"].asString());}
-   for(auto& s:segs)s["CHANGED"]=changed.count(s["APP_ID"].asString())?1:0;persist([&]{db_.append(id,array(),array(),segs);});
-   phase("compare_seconds");db_.log(id,"comparing","Comparison finished",normalizedCount,comparisonCount,procedures["compare"]["id"].asString());state("aggregating",78);db_.log(id,"aggregating","Aggregation started",0,comparisonCount,procedures["aggregate"]["id"].asString());auto comparisons=selectRows(db_,id,"comparison_values");Json::Value facts;
-   if(procedures["aggregate"]["mode"].asString()=="native")facts=lens::aggregate(comparisons,segs,settings);else{Json::Value input;input["comparison_rows"]=std::move(comparisons);input["union_rows"]=selectRows(db_,id,"normalized_values");input["segments"]=segs;facts=invoke("aggregate",input);}lens::validateFacts(facts);for(auto& f:facts){for(auto& a:f["APP_IDS"])if(!std::binary_search(pairs.begin(),pairs.end(),Pair{a.asString(),{},{}},[](const Pair& a,const Pair& b){return a.id<b.id;}))throw std::runtime_error("Aggregate references unknown application");}check();persist([&]{db_.facts(id,facts);});phase("aggregate_seconds");timings["storage_seconds"]=storageSeconds;db_.log(id,"aggregating","Aggregate facts: "+std::to_string(facts.size()),facts.size(),facts.size(),procedures["aggregate"]["id"].asString());
-   const auto factCount=facts.size();facts.clear();Json::Value checkRows=array();const auto& selectedChecks=run["snapshot"]["checks"];
-   if(!selectedChecks.empty()){state("checking",92);for(const auto& procedure:selectedChecks)db_.log(id,"checking","Check selected: "+procedure["name"].asString(),0,comparisonCount,procedure["id"].asString());if(comparisons.empty())comparisons=selectRows(db_,id,"comparison_values");Json::Value input;input["comparison_rows"]=std::move(comparisons);input["segments"]=segs;checkRows=lens::executePython("checks",lens::encode(selectedChecks),input,settings,cancelled,[&](const std::string& line){db_.log(id,"checking",line);});std::set<std::string> ids;for(const auto& pair:pairs)ids.insert(pair.id);lens::validateCheckResults(checkRows,selectedChecks,ids);check();persist([&]{db_.saveChecks(id,checkRows);});db_.log(id,"checking","All checks finished",selectedChecks.size(),checkRows.size());}phase("checks_seconds");timings["storage_seconds"]=storageSeconds;
-   long decisionChanged=0;for(auto& s:segs)decisionChanged+=s["DECISION_CHANGED"].asInt()!=0;Json::Value summary;summary["total_apps"]=Json::UInt64(pairs.size());summary["normalized_rows"]=Json::Int64(normalizedCount);summary["comparison_rows"]=Json::Int64(comparisonCount);summary["rows"]=Json::Int64(comparisonCount);summary["changed_rows"]=Json::Int64(changedCount);summary["changed_apps"]=Json::UInt64(changed.size());summary["decision_changed"]=Json::Int64(decisionChanged);summary["facts"]=factCount;summary["check_rows"]=checkRows.size();long unchangedDecision=0,withExternal=0;for(const auto& segment:segs){if(segment["CHANGED"].asInt()&&!segment["DECISION_CHANGED"].asInt())++unchangedDecision;if(segment["DECISION_CHANGED"].asInt()&&segment["EXTERNAL_CHANGED"].asInt())++withExternal;}summary["changed_without_decision"]=Json::Int64(unchangedDecision);summary["decision_with_external_change"]=Json::Int64(withExternal);summary["decision_without_external_change"]=Json::Int64(decisionChanged-withExternal);summary["timings"]=timings;summary["total_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();check();Json::Value patch;patch["status"]="completed";patch["stage"]="completed";patch["progress"]=100;patch["summary"]=summary;patch["facts"]=factCount;patch["check_rows"]=checkRows.size();patch["elapsed_seconds"]=summary["total_seconds"];patch["finished_at"]=lens::timestamp();db_.patchRun(id,patch);db_.log(id,"completed","All stages completed; results published");
+   const bool nativeNormalize = procedures["normalize"]["mode"] == "native";
+   const bool nativeCompare = procedures["compare"]["mode"] == "native";
+   const bool nativePair = nativeNormalize && nativeCompare;
+   const auto normalizeId = procedures["normalize"]["id"].asString();
+   const auto compareId = procedures["compare"]["id"].asString();
+   const auto aggregateId = procedures["aggregate"]["id"].asString();
+   Json::Value segs = array();
+   if (!nativeNormalize) {
+    for (const auto& pair : pairs)
+     segs.append(lens::segments(pair.before, pair.after, pair.id, settings));
+   }
+   phase("segments_seconds");
+   state("normalizing", 5);
+   db_.log(id, "normalizing", "Normalization started", 0, pairs.size(), normalizeId);
+   constexpr size_t batchSize = 100; // Python procedures receive the original application batches.
+   constexpr size_t nativeBatchRows = 8192;
+   size_t normalizedCount = 0, comparisonCount = 0, changedCount = 0;
+   std::set<std::string> changed;
+   double fusedCompareSeconds = 0;
+   auto countComparison = [&](const Json::Value& row) {
+    if (row["DIFF_FLAG"].asInt()) {
+     ++changedCount;
+     changed.insert(row["APP_ID"].asString());
+    }
+   };
+   for (size_t begin = 0; begin < pairs.size();) {
+    check();
+    auto end = std::min(begin + batchSize, pairs.size());
+    Json::Value rows = array(), nativeCompared = array();
+    if (nativeNormalize) {
+     for (size_t i = begin; i < end; ++i) {
+      const auto& pair = pairs[i];
+      auto before = lens::normalize(pair.before, pair.id, "BEFORE", settings);
+      auto after = lens::normalize(pair.after, pair.id, "AFTER", settings);
+      Json::Value compared;
+      if (nativePair) {
+       const auto compareStart = std::chrono::steady_clock::now();
+       compared = lens::compareNormalizedPair(before, after);
+       fusedCompareSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - compareStart).count();
+      }
+      const auto segmentStart = std::chrono::steady_clock::now();
+      auto segment = nativePair ? lens::segmentsFromNormalized(before, after, pair.id, compared)
+                                : lens::segmentsFromNormalized(before, after, pair.id);
+      segmentSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - segmentStart).count();
+      if (nativePair) {
+       if (segment["CHANGED"].asInt()) changed.insert(pair.id);
+       comparisonCount += compared.size();
+       for (auto& row : compared) {
+        changedCount += row["DIFF_FLAG"].asInt();
+        nativeCompared.append(std::move(row));
+       }
+      }
+      segs.append(std::move(segment));
+      for (auto& row : before) rows.append(std::move(row));
+      for (auto& row : after) rows.append(std::move(row));
+      if (nativePair && size_t(rows.size()) + nativeCompared.size() >= nativeBatchRows) {
+       end = i + 1; // Always finish an application before flushing the batch.
+       break;
+      }
+     }
+    } else {
+     Json::Value payload;
+     auto& records = payload["records"];
+     records = array();
+     std::set<std::string> appIds;
+     for (size_t i = begin; i < end; ++i) {
+      const auto& pair = pairs[i];
+      appIds.insert(pair.id);
+      for (const auto* source : {"BEFORE", "AFTER"}) {
+       Json::Value record;
+       record["APP_ID"] = pair.id;
+       record["SOURCE"] = source;
+       record["raw"] = std::string_view(source) == "BEFORE" ? pair.before : pair.after;
+       records.append(std::move(record));
+      }
+     }
+     rows = invoke("normalize", payload);
+     lens::validateNormalized(rows);
+     for (const auto& row : rows)
+      if (!appIds.count(row["APP_ID"].asString())) throw std::runtime_error("Normalizer returned foreign APP_ID");
+    }
+    normalizedCount += rows.size();
+    persist([&] { db_.append(id, rows, nativeCompared, array()); });
+    for (size_t i = begin; i < end; ++i) {
+     std::string{}.swap(pairs[i].before);
+     std::string{}.swap(pairs[i].after);
+    }
+    Json::Value counters;
+    counters["processed_files"] = Json::UInt64(end * 2);
+    counters["normalized_rows"] = Json::Int64(normalizedCount);
+    db_.patchRun(id, counters);
+    state("normalizing", 5 + int(40 * end / pairs.size()));
+    db_.log(id, "normalizing", "Normalized rows: " + std::to_string(normalizedCount), end, pairs.size(), normalizeId);
+    begin = end;
+   }
+   phase("normalize_seconds");
+   timings["normalize_seconds"] = timings["normalize_seconds"].asDouble() - segmentSeconds - fusedCompareSeconds;
+   timings["segments_seconds"] = timings["segments_seconds"].asDouble() + segmentSeconds;
+   db_.log(id, "normalizing", "Normalization finished", pairs.size() * 2, normalizedCount, normalizeId);
+   state("comparing", 46);
+   db_.log(id, "comparing", "Comparison started", 0, pairs.size(), compareId);
+   if (nativePair) {
+    Json::Value counts;
+    counts["comparison_rows"] = Json::Int64(comparisonCount);
+    counts["changed_rows"] = Json::Int64(changedCount);
+    db_.patchRun(id, counts);
+   } else {
+    for (size_t begin = 0; begin < pairs.size(); begin += batchSize) {
+     check();
+     const auto end = std::min(begin + batchSize, pairs.size());
+     std::vector<std::string> ids;
+     for (size_t i = begin; i < end; ++i) ids.push_back(pairs[i].id);
+     auto flat = selectRows(db_, id, "normalized_values", ids);
+     Json::Value before = array(), after = array(), compared;
+     std::set<std::tuple<std::string, std::string, std::string>> expected;
+     for (auto& row : flat) {
+      expected.emplace(row["APP_ID"].asString(), row["PATH"].asString(), row["ARRAY_KEY"].asString());
+      auto& side = row["SOURCE"] == "BEFORE" ? before : after;
+      side.append(std::move(row));
+     }
+     flat.clear();
+     if (nativeCompare) {
+      compared = lens::compare(before, after, settings);
+     } else {
+      Json::Value payload;
+      payload["before"] = std::move(before);
+      payload["after"] = std::move(after);
+      auto& batchSegments = payload["segments"];
+      batchSegments = array();
+      for (size_t i = begin; i < end; ++i) batchSegments.append(segs[Json::ArrayIndex(i)]);
+      auto result = invoke("compare", payload);
+      if (result.isObject() && result["segments"].isArray() && !result["segments"].empty()) {
+       std::map<std::string, Json::Value> replacement;
+       for (auto& segment : result["segments"]) {
+        auto app = segment["APP_ID"].asString();
+        if (!std::binary_search(ids.begin(), ids.end(), app) || !replacement.emplace(app, std::move(segment)).second)
+         throw std::runtime_error("Invalid custom segment identity");
+       }
+       if (replacement.size() != ids.size()) throw std::runtime_error("Custom comparison must return every batch segment");
+       for (size_t i = begin; i < end; ++i) segs[Json::ArrayIndex(i)] = std::move(replacement.at(pairs[i].id));
+      }
+      compared = result.isArray() ? std::move(result) : std::move(result["rows"]);
+     }
+     lens::validateComparison(compared);
+     for (const auto& row : compared) {
+      if (!expected.erase({row["APP_ID"].asString(), row["PATH"].asString(), row["ARRAY_KEY"].asString()}))
+       throw std::runtime_error("Comparison must preserve the full union of attribute identities");
+      countComparison(row);
+     }
+     if (!expected.empty()) throw std::runtime_error("Comparison must preserve the full union of attribute identities");
+     comparisonCount += compared.size();
+     persist([&] { db_.append(id, array(), compared, array()); });
+     Json::Value counts;
+     counts["comparison_rows"] = Json::Int64(comparisonCount);
+     counts["changed_rows"] = Json::Int64(changedCount);
+     db_.patchRun(id, counts);
+     state("comparing", 46 + int(30 * end / pairs.size()));
+     db_.log(id, "comparing", "Compared rows: " + std::to_string(comparisonCount), end, pairs.size(), compareId);
+    }
+   }
+   for (auto& segment : segs) segment["CHANGED"] = changed.count(segment["APP_ID"].asString()) ? 1 : 0;
+   persist([&] { db_.append(id, array(), array(), segs); });
+   phase("compare_seconds");
+   timings["compare_seconds"] = timings["compare_seconds"].asDouble() + fusedCompareSeconds;
+   db_.log(id, "comparing", "Comparison finished", normalizedCount, comparisonCount, compareId);
+
+   state("aggregating", 78);
+   db_.log(id, "aggregating", "Aggregation started", 0, comparisonCount, aggregateId);
+   const auto& selectedChecks = run["snapshot"]["checks"];
+   Json::Value comparisons, facts;
+   const bool nativeAggregate = procedures["aggregate"]["mode"] == "native";
+   if (nativeAggregate && selectedChecks.empty()) {
+    auto source = [&](const lens::ComparisonBatch& accept) { visitComparisons(db_, id, accept, check); };
+    facts = lens::aggregateBatches(source, segs, settings);
+   } else {
+    // Python procedures need the entire comparison array. Read it once for both consumers.
+    comparisons = selectRows(db_, id, "comparison_values");
+    if (nativeAggregate) {
+     facts = lens::aggregate(comparisons, segs, settings);
+    } else {
+     Json::Value payload;
+     payload["comparison_rows"] = std::move(comparisons);
+     payload["union_rows"] = selectRows(db_, id, "normalized_values");
+     payload["segments"] = std::move(segs);
+     facts = invoke("aggregate", payload);
+     segs = std::move(payload["segments"]);
+     if (!selectedChecks.empty()) comparisons = std::move(payload["comparison_rows"]);
+    }
+   }
+   lens::validateFacts(facts);
+   for (const auto& fact : facts) {
+    for (const auto& member : fact["APP_IDS"]) {
+     const auto app = member.asString();
+     const auto it = std::lower_bound(pairs.begin(), pairs.end(), app,
+                                      [](const Pair& p, const std::string& key) { return p.id < key; });
+     if (it == pairs.end() || it->id != app) throw std::runtime_error("Aggregate references unknown application");
+    }
+   }
+   check();
+   persist([&] { db_.facts(id, facts); });
+   phase("aggregate_seconds");
+   db_.log(id, "aggregating", "Aggregate facts: " + std::to_string(facts.size()), facts.size(), facts.size(), aggregateId);
+   const auto factCount = facts.size();
+   facts.clear();
+   Json::Value checkRows = array();
+   if (!selectedChecks.empty()) {
+    state("checking", 92);
+    for (const auto& procedure : selectedChecks)
+     db_.log(id, "checking", "Check selected: " + procedure["name"].asString(), 0, comparisonCount, procedure["id"].asString());
+    Json::Value payload;
+    payload["comparison_rows"] = std::move(comparisons);
+    payload["segments"] = std::move(segs);
+    checkRows = lens::executePython("checks", lens::encode(selectedChecks), payload, settings, cancelled,
+                                   [&](const std::string& line) { db_.log(id, "checking", line); });
+    segs = std::move(payload["segments"]);
+    std::set<std::string> ids;
+    for (const auto& pair : pairs) ids.insert(pair.id);
+    lens::validateCheckResults(checkRows, selectedChecks, ids);
+    check();
+    persist([&] { db_.saveChecks(id, checkRows); });
+    db_.log(id, "checking", "All checks finished", selectedChecks.size(), checkRows.size());
+   }
+   phase("checks_seconds");
+   timings["storage_seconds"] = storageSeconds;
+   long decisionChanged=0;for(auto& s:segs)decisionChanged+=s["DECISION_CHANGED"].asInt()!=0;Json::Value summary;summary["total_apps"]=Json::UInt64(pairs.size());summary["normalized_rows"]=Json::Int64(normalizedCount);summary["comparison_rows"]=Json::Int64(comparisonCount);summary["rows"]=Json::Int64(comparisonCount);summary["changed_rows"]=Json::Int64(changedCount);summary["changed_apps"]=Json::UInt64(changed.size());summary["decision_changed"]=Json::Int64(decisionChanged);summary["facts"]=factCount;summary["check_rows"]=checkRows.size();long unchangedDecision=0,withExternal=0;for(const auto& segment:segs){if(segment["CHANGED"].asInt()&&!segment["DECISION_CHANGED"].asInt())++unchangedDecision;if(segment["DECISION_CHANGED"].asInt()&&segment["EXTERNAL_CHANGED"].asInt())++withExternal;}summary["changed_without_decision"]=Json::Int64(unchangedDecision);summary["decision_with_external_change"]=Json::Int64(withExternal);summary["decision_without_external_change"]=Json::Int64(decisionChanged-withExternal);
+   if (profiling) {
+    summary["profile"]["pipeline"] = pipelineProfile.report();
+    summary["profile"]["storage"] = copyProfile.report();
+   }
+   summary["timings"]=timings;summary["total_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();check();Json::Value patch;patch["status"]="completed";patch["stage"]="completed";patch["progress"]=100;patch["summary"]=summary;patch["facts"]=factCount;patch["check_rows"]=checkRows.size();patch["elapsed_seconds"]=summary["total_seconds"];patch["finished_at"]=lens::timestamp();db_.patchRun(id,patch);db_.log(id,"completed","All stages completed; results published");
   }catch(const std::exception& e){Json::Value p;p["status"]=cancelled()?"cancelled":"failed";p["stage"]=p["status"];p["error"]=std::string(e.what());p["finished_at"]=lens::timestamp();try{db_.patchRun(id,p);db_.log(id,p["status"].asString(),e.what());}catch(...){}}
  }
  public:
@@ -229,10 +493,10 @@ class Api {
      if(name!="manifest.json"&&(!std::regex_match(name,uploadPath)||!lens::supportsInputFormat(fileFormat(name))))throw HttpError(400,"Unsupported upload path: "+name);
      if(!seen.insert(name).second)throw HttpError(400,"Duplicate upload path");auto content=file["content"].asString();bytes+=content.size();if(content.size()>8*1024*1024||bytes>48*1024*1024)throw HttpError(413,"Dataset upload exceeds size limit (48 MiB total, 8 MiB per file)");auto path=dest/fs::path(name);fs::create_directories(path.parent_path());std::ofstream out(path,std::ios::binary);out<<content;if(!out)throw std::runtime_error("Cannot write uploaded dataset");
     }
-    auto input=inspectDataset(dest.string());Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=id;out["name"]=v.get("name",prefix.empty()?id:prefix.substr(0,prefix.size()-1));out["path"]=dest.string();out["applications"]=Json::UInt64(input.pairs.size());out["files"]=Json::UInt64(input.pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();out["validation"]= "valid";db_.save("datasets",out,name);respond(cb,out,201);
+    auto input=inspectDataset(dest.string());Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=id;out["name"]=v.get("name",prefix.empty()?id:prefix.substr(0,prefix.size()-1));out["path"]=dest.string();out["applications"]=Json::UInt64(input.applicationCount);out["files"]=Json::UInt64(input.applicationCount*2);out["owner"]=name;out["created_at"]=lens::timestamp();out["validation"]= "valid";db_.save("datasets",out,name);respond(cb,out,201);
    }catch(...){fs::remove_all(dest);throw;}
   });
-  route("/api/v1/datasets",{drogon::Post},[&](auto req,auto cb,auto){auto name=user(req);auto v=body(req);auto path=fs::canonical(v["path"].asString()).string();auto dataRoot=fs::weakly_canonical(env("DATA_ROOT","/data"));auto candidate=fs::path(path);if(candidate!=dataRoot&&!inside(candidate,dataRoot))throw HttpError(400,"Register server datasets under DATA_ROOT; use upload for local files");auto input=inspectDataset(path);Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=randomId();out["name"]=v.get("name",fs::path(path).filename().string());out["path"]=path;out["applications"]=Json::UInt64(input.pairs.size());out["files"]=Json::UInt64(input.pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();db_.save("datasets",out,name);respond(cb,out,201);});
+  route("/api/v1/datasets",{drogon::Post},[&](auto req,auto cb,auto){auto name=user(req);auto v=body(req);auto path=fs::canonical(v["path"].asString()).string();auto dataRoot=fs::weakly_canonical(env("DATA_ROOT","/data"));auto candidate=fs::path(path);if(candidate!=dataRoot&&!inside(candidate,dataRoot))throw HttpError(400,"Register server datasets under DATA_ROOT; use upload for local files");auto input=inspectDataset(path);Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=randomId();out["name"]=v.get("name",fs::path(path).filename().string());out["path"]=path;out["applications"]=Json::UInt64(input.applicationCount);out["files"]=Json::UInt64(input.applicationCount*2);out["owner"]=name;out["created_at"]=lens::timestamp();db_.save("datasets",out,name);respond(cb,out,201);});
   route("/api/v1/procedures(?:/([a-f0-9]+))?",{drogon::Post,drogon::Put},[&](auto req,auto cb,auto args){auto name=user(req);auto v=body(req);std::string id=args.empty()||args[0].empty()?randomId():args[0];if((req->method()==drogon::Put)&&(args.empty()||args[0].empty()))throw HttpError(400,"Procedure id required");if(req->method()==drogon::Put)db_.get("procedures",id,name);auto kind=v["kind"].asString();if(kind!="normalize"&&kind!="compare"&&kind!="aggregate"&&kind!="check")throw HttpError(400,"Unknown procedure kind");if(!v["code"].isString()||v["code"].asString().empty()||v["code"].asString().size()>1024*1024)throw HttpError(400,"Python source required, maximum 1 MiB");Json::Value validation;validation["procedure_kind"]=kind;validation["worker_timeout_seconds"]=15;auto validationResult=lens::executePython("validate",v["code"].asString(),Json::Value(Json::objectValue),validation,[]{return false;},[](const std::string&){});if(kind=="check"){if(validationResult.size()!=1||!validationResult[0]["params"].isObject())throw HttpError(400,"Invalid CHECK metadata");auto defaults=validationResult[0]["params"];if(v["params"].isObject())for(auto it=v["params"].begin();it!=v["params"].end();++it)defaults[it.name()]=*it;v["params"]=defaults;v["check_source_id"]=validationResult[0]["id"];if(!v["name"].isString()||v["name"].asString().empty())v["name"]=validationResult[0]["label"];}v["id"]=id;v["owner"]=name;v["mode"]="python";v["source"]=v.get("source","workspace");if(v["source"]!="workspace"&&v["source"]!="file")throw HttpError(400,"Source must be workspace or file");if(!v["params"].isObject())v["params"]=Json::Value(Json::objectValue);v["sha256"]=hash(v["code"].asString());v["created_at"]=lens::timestamp();db_.save("procedures",v,name);respond(cb,v,req->method()==drogon::Put?200:201);});
   route("/api/v1/configs(?:/([a-f0-9]+))?",{drogon::Post,drogon::Put},[&](auto req,auto cb,auto args){auto name=user(req);auto id=args.empty()||args[0].empty()?randomId():args[0];if((req->method()==drogon::Put)&&(args.empty()||args[0].empty()))throw HttpError(400,"Configuration id required");if(req->method()==drogon::Put)db_.get("configs",id,name);auto v=config(body(req),name,id);db_.save("configs",v,name);respond(cb,v,req->method()==drogon::Put?200:201);});
   route("/api/v1/(configs|procedures)/([a-zA-Z0-9_-]+)",{drogon::Get},[&](auto req,auto cb,auto args){respond(cb,db_.get(args[0],args[1],user(req)));});
@@ -260,4 +524,4 @@ int main(){try{Storage db(env("DATABASE_URL","postgresql://lens:lens@postgres:54
  for(auto kind:{"normalize","compare","aggregate"}){auto file=fs::path(env("PROCEDURES_ROOT","/app/python-worker/procedures"))/(std::string(kind)+".py");if(fs::exists(file)){Json::Value p;p["id"]=std::string("python-")+kind;p["name"]=std::string("Python · ")+kind;p["kind"]=kind;p["mode"]="python";p["source"]="file";p["code"]=readFile(file);p["sha256"]=hash(p["code"].asString());p["params"]=Json::Value(Json::objectValue);db.save("procedures",p,"");}}
  auto checksRoot=fs::path(env("CHECKS_ROOT","/app/python-worker/checks"));auto catalogPath=checksRoot/"catalog.json";if(fs::exists(catalogPath)){auto catalog=lens::decode(readFile(catalogPath));for(const auto& item:catalog){auto filename=item["file"].asString();if(!std::regex_match(filename,std::regex("check_[a-z0-9_]+\\.py")))throw std::runtime_error("Invalid bundled check filename");Json::Value procedure;procedure["id"]=fs::path(filename).stem().string();procedure["kind"]="check";procedure["mode"]="python";procedure["source"]="file";procedure["name"]=item["label"];procedure["params"]=item["params"];procedure["code"]=readFile(checksRoot/filename);procedure["sha256"]=hash(procedure["code"].asString());db.save("procedures",procedure,"");}}
  auto data=fs::path(env("DATA_ROOT","/data"));if(fs::exists(data))for(auto& e:fs::directory_iterator(data)){if(!e.is_directory()||!fs::exists(e.path()/"manifest.json"))continue;try{auto manifest=lens::decode(readFile(e.path()/"manifest.json"));Json::Value d;d["id"]="builtin-"+e.path().filename().string();d["name"]=e.path().filename().string();d["path"]=fs::canonical(e.path()).string();d["applications"]=manifest["applications"];d["input_contract"]=inputContract(manifest);d["files"]=manifest["applications"].asUInt()*2;db.save("datasets",d,"");}catch(const std::exception& error){LOG_ERROR<<"Dataset discovery: "<<error.what();}}
- Jobs jobs(db);Api api(db,jobs);drogon::app().setThreadNum(4).setClientMaxBodySize(64*1024*1024).addListener("0.0.0.0",8080).run();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}}
+ Jobs jobs(db);Api api(db,jobs);drogon::app().setUploadPath(env("UPLOAD_ROOT","/uploads")).setThreadNum(4).setClientMaxBodySize(64*1024*1024).addListener("0.0.0.0",8080).run();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}}

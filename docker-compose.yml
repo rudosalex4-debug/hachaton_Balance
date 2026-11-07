@@ -40,6 +40,7 @@ services:
     environment:
       DATABASE_URL: postgresql://lens:${POSTGRES_PASSWORD:-lens-local-development}@postgres:5432/lens
       DATA_ROOT: /data
+      LENS_PROFILE: ${LENS_PROFILE:-0}
       UPLOAD_ROOT: /uploads
       JOBS_ROOT: /jobs
       MIGRATIONS_PATH: /app/database/migrations/001_init.sql

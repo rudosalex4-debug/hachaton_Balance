@@ -1,14 +1,19 @@
 #include "core.hpp"
+#include "pipeline_profile.hpp"
 #include <simdjson.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <charconv>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <unordered_set>
 
@@ -45,7 +50,7 @@ std::string typeName(ValueType type) { switch(type){case ValueType::Null:return 
 ValueType parseType(const std::string& type) { if(type=="NULL"||type=="null")return ValueType::Null;if(type=="BOOLEAN"||type=="bool")return ValueType::Boolean;if(type=="NUMBER"||type=="number"||type=="int"||type=="float")return ValueType::Number;if(type=="STRING"||type=="str")return ValueType::String;throw std::runtime_error("Unsupported VALUE_TYPE: "+type); }
 std::vector<std::string> split(const std::string& text, char delim='.') { std::vector<std::string> out; std::stringstream stream(text);std::string part;while(std::getline(stream,part,delim))out.push_back(part);return out; }
 std::string join(const std::vector<std::string>& values,const std::string& sep) {std::string out;bool first=true;for(auto& x:values){if(!first)out+=sep;first=false;out+=x;}return out;}
-bool glob(const std::string& pattern,const std::string& value) { size_t p=0,v=0,star=std::string::npos,mark=0;while(v<value.size()){if(p<pattern.size()&&(pattern[p]=='?'||pattern[p]==value[v])){++p;++v;}else if(p<pattern.size()&&pattern[p]=='*'){star=p++;mark=v;}else if(star!=std::string::npos){p=star+1;v=++mark;}else return false;}while(p<pattern.size()&&pattern[p]=='*')++p;return p==pattern.size();}
+bool glob(std::string_view pattern,std::string_view value) { size_t p=0,v=0,star=std::string::npos,mark=0;while(v<value.size()){if(p<pattern.size()&&(pattern[p]=='?'||pattern[p]==value[v])){++p;++v;}else if(p<pattern.size()&&pattern[p]=='*'){star=p++;mark=v;}else if(star!=std::string::npos){p=star+1;v=++mark;}else return false;}while(p<pattern.size()&&pattern[p]=='*')++p;return p==pattern.size();}
 std::string escape(const std::string& text) {std::string out;for(unsigned char c:text){switch(c){case '%':out+="%25";break;case '|':out+="%7C";break;case '~':out+="%7E";break;default:out+=static_cast<char>(c);}}return out;}
 struct Scalar {ValueType type;std::string value;};
 Scalar scalar(simdjson::ondemand::value value) {
@@ -66,15 +71,20 @@ std::string identity(const Scalar& value) {
 std::string pointer(const std::string& path){std::string out;for(auto& part:split(path)){out+='/';for(char c:part){if(c=='~')out+="~0";else if(c=='/')out+="~1";else out+=c;}}return out;}
 Scalar fieldScalar(const std::string& raw,const std::string& field){simdjson::ondemand::parser p;auto data=simdjson::padded_string(raw);auto doc=p.iterate(data);return scalar(doc.at_pointer(pointer(field)).value());}
 Json::Value structure(const std::string& path){auto parts=split(path);Json::Value out;out["PATH"]=path;out["PREFIX"]=parts.empty()?"":parts[0];out["CLASS"]=parts.size()>1?parts[1]:"";out["KEY"]=parts.empty()?"":parts.back();std::vector<std::string> suffix;if(parts.size()>3)suffix.assign(parts.begin()+2,parts.end()-1);out["SUFFIX"]=join(suffix,".");return out;}
-int decimalCompare(const std::string& a,const std::string& b){
-    if(a==b)return 0;
-    bool an=a[0]=='-',bn=b[0]=='-';if(an!=bn)return an?-1:1;
-    auto left=a.substr(an?1:0),right=b.substr(bn?1:0);
-    auto li=left.find('.'),ri=right.find('.');if(li==std::string::npos)li=left.size();if(ri==std::string::npos)ri=right.size();
-    int sign=an?-1:1;if(li!=ri)return li<ri?-sign:sign;
-    if(left.find('.')==std::string::npos)left+='.';if(right.find('.')==std::string::npos)right+='.';
-    size_t length=std::max(left.size(),right.size());left.resize(length,'0');right.resize(length,'0');
-    return left<right?-sign:sign;
+// Canonical decimals have no redundant leading or fractional trailing zeros.
+// With equal integer widths their magnitudes therefore sort lexicographically.
+int decimalCompare(std::string_view left, std::string_view right) {
+    bool negative = left.front() == '-';
+    if (negative != (right.front() == '-')) return negative ? -1 : 1;
+    if (negative) { left.remove_prefix(1); right.remove_prefix(1); }
+    auto integerWidth = [](std::string_view number) {
+        return std::min(number.size(), number.find('.'));
+    };
+    auto a = integerWidth(left), b = integerWidth(right);
+    int order = a < b ? -1 : a > b ? 1 : left.compare(right);
+    // compare() only promises the sign of its result.
+    if (order == 0) return 0;
+    return (order < 0) != negative ? -1 : 1;
 }
 std::string numericEdge(const Json::Value& edge){
     if(edge.isString())return canonicalNumber(edge.asString());
@@ -88,29 +98,84 @@ std::string numericEdge(const Json::Value& edge){
     }
     return canonicalNumber(dump(edge));
 }
-std::string bucket(const Scalar& value,const std::string& path,const Json::Value& config){
-    if(value.type!=ValueType::Number)return value.value;
-    const auto& rules=config["bucket_rules"];
-    for(auto& key:rules.getMemberNames())if(glob(key,path)){
-        const auto& edges=rules[key];if(!edges.isArray()||edges.empty())throw std::runtime_error("Bucket edges must be a nonempty array");
+class BucketRules {
+    struct Rule {
+        std::string pattern;
+        const Json::Value& definition;
         std::vector<std::string> boundaries;
-        for(const auto& edge:edges){
-            auto label=numericEdge(edge);
-            if(!boundaries.empty()&&decimalCompare(label,boundaries.back())<=0)throw std::runtime_error("Bucket edges must be finite and ascending");
-            boundaries.push_back(label);
+    };
+    const Json::Value& definitions;
+    std::optional<std::vector<Rule>> rules;
+    // Path IDs belong to this document's dictionary. A null match also saves
+    // a repeated glob scan for numeric attributes outside all intervals.
+    std::unordered_map<uint32_t, const Rule*> byPath;
+
+    const Rule* resolve(const std::string& path) {
+        if (!rules) {
+            rules.emplace();
+            rules->reserve(definitions.size());
+            for (const auto& pattern : definitions.getMemberNames())
+                rules->push_back({pattern, definitions[pattern], {}});
         }
-        std::string low="-inf";
-        for(const auto& label:boundaries){if(decimalCompare(value.value,label)<=0)return "("+low+"; "+label+"]";low=label;}
-        return "("+low+"; +inf)";
+        for (auto& rule : *rules) {
+            if (!glob(rule.pattern, path)) continue;
+            if (rule.boundaries.empty()) {
+                if (!rule.definition.isArray() || rule.definition.empty())
+                    throw std::runtime_error("Bucket edges must be a nonempty array");
+                rule.boundaries.reserve(rule.definition.size());
+                for (const auto& edge : rule.definition) {
+                    auto label = numericEdge(edge);
+                    if (!rule.boundaries.empty() && decimalCompare(label, rule.boundaries.back()) <= 0)
+                        throw std::runtime_error("Bucket edges must be finite and ascending");
+                    rule.boundaries.push_back(std::move(label));
+                }
+            }
+            return &rule;
+        }
+        return nullptr;
     }
-    return value.value;
-}
+public:
+    explicit BucketRules(const Json::Value& config) : definitions(config["bucket_rules"]) {}
+
+    std::optional<std::string> adjusted(const Scalar& value, uint32_t pathId, const std::string& path) {
+        auto [entry, inserted] = byPath.try_emplace(pathId, nullptr);
+        if (inserted) entry->second = resolve(path);
+        if (!entry->second) return std::nullopt;
+        const auto& edges = entry->second->boundaries;
+        auto high = std::lower_bound(edges.begin(), edges.end(), value.value,
+            [](const auto& edge, const auto& number) { return decimalCompare(edge, number) < 0; });
+        std::string label = "(";
+        label += high == edges.begin() ? "-inf" : *std::prev(high);
+        label += "; ";
+        return high == edges.end() ? label + "+inf)" : label + *high + "]";
+    }
+};
 
 class Normalizer {
     const Json::Value& config;std::string app,source;StringInterner dictionary;std::vector<FlatRow> rows;
-    bool excluded(const std::string& path){for(const auto& entry:config["exclude_paths"]){auto x=entry.asString();if(path==x||path.rfind(x+".",0)==0||glob(x,path))return true;}return false;}
+    BucketRules buckets;
+    const uint32_t appKey;
+    const bool after;
+    Json::UInt maxDepth = 0;
+    std::optional<Json::UInt> maxRows;
+    bool excluded(const std::string& path){
+        for (const auto& entry : config["exclude_paths"]) {
+            // String references avoid allocating both a pattern and its dotted
+            // prefix at every nested node. Preserve JsonCpp's scalar coercions.
+            const char* begin;
+            const char* end;
+            std::string fallback;
+            std::string_view pattern;
+            if (entry.getString(&begin, &end)) pattern = std::string_view(begin, end - begin);
+            else { fallback = entry.asString(); pattern = fallback; }
+            if (path == pattern || (path.size() > pattern.size() && path[pattern.size()] == '.' &&
+                                    path.compare(0, pattern.size(), pattern) == 0) ||
+                glob(pattern, path)) return true;
+        }
+        return false;
+    }
     void walk(simdjson::ondemand::value value,const std::string& path,const std::vector<std::string>& keys,size_t depth){
-        if(depth>static_cast<size_t>(config.get("max_depth",256).asUInt()))throw std::runtime_error("JSON nesting exceeds max_depth");
+        if(depth>maxDepth)throw std::runtime_error("JSON nesting exceeds max_depth");
         if(excluded(path)) { value.raw_json().value();return; }
         using simdjson::ondemand::json_type;
         auto kind=value.type().value();
@@ -147,31 +212,121 @@ class Normalizer {
             }
         }else emit(scalar(value),path,keys);
     }
-    void emit(const Scalar& val,const std::string& path,const std::vector<std::string>& keys){
-        if(rows.size()>=config.get("max_rows_per_app",10000).asUInt())throw std::runtime_error("Normalized response exceeds max_rows_per_app");
-        rows.push_back({dictionary.intern(app),dictionary.intern(path),dictionary.intern(join(keys,"|")),dictionary.intern(val.value),dictionary.intern(bucket(val,path,config)),val.type,source=="AFTER"});
+    void emit(const Scalar& value, const std::string& path, const std::vector<std::string>& keys) {
+        if (!maxRows) maxRows = config.get("max_rows_per_app", 10000).asUInt();
+        if (rows.size() >= *maxRows) throw std::runtime_error("Normalized response exceeds max_rows_per_app");
+        auto pathId = dictionary.intern(path);
+        auto valueId = dictionary.intern(value.value);
+        auto adjustedId = valueId;
+        if (value.type == ValueType::Number) {
+            if (auto interval = buckets.adjusted(value, pathId, path)) adjustedId = dictionary.intern(*interval);
+        }
+        rows.push_back({appKey, pathId, dictionary.intern(join(keys, "|")), valueId, adjustedId, value.type, after});
     }
 public:
-    Normalizer(const Json::Value& cfg,std::string id,std::string src):config(cfg),app(std::move(id)),source(std::move(src)){}
-    Json::Value run(const std::string& raw){
-        if(source!="BEFORE"&&source!="AFTER")throw std::runtime_error("SOURCE must be BEFORE or AFTER");
-        if(raw.size()>config.get("max_json_bytes",10*1024*1024).asUInt())throw std::runtime_error("JSON exceeds max_json_bytes");
-        simdjson::ondemand::parser parser;auto padded=simdjson::padded_string(raw);auto doc=parser.iterate(padded);
-        if(doc.type().value()!=simdjson::ondemand::json_type::object)throw std::runtime_error("Response must be a JSON object");
-        walk(doc.get_value().value(),"",{},0);
-        std::sort(rows.begin(),rows.end(),[&](const auto& x,const auto& y){return std::tie(dictionary.get(x.path),dictionary.get(x.arrayKey)) < std::tie(dictionary.get(y.path),dictionary.get(y.arrayKey));});
+    Normalizer(const Json::Value& cfg, std::string id, std::string src)
+        : config(cfg), app(std::move(id)), source(std::move(src)), buckets(cfg),
+          appKey(dictionary.intern(app)), after(source == "AFTER") {}
+
+    Json::Value run(const std::string& raw) {
+        if (source != "BEFORE" && source != "AFTER") throw std::runtime_error("SOURCE must be BEFORE or AFTER");
+        if (raw.size() > config.get("max_json_bytes", 10*1024*1024).asUInt())
+            throw std::runtime_error("JSON exceeds max_json_bytes");
+        simdjson::ondemand::parser parser;
+        auto padded = simdjson::padded_string(raw);
+        auto doc = parser.iterate(padded);
+        if (doc.type().value() != simdjson::ondemand::json_type::object)
+            throw std::runtime_error("Response must be a JSON object");
+        maxDepth = config.get("max_depth", 256).asUInt();
+        walk(doc.get_value().value(), "", {}, 0);
+        {
+            OperationTimer timer(&PipelineProfile::keySort);
+            auto key = [&](const FlatRow& row) {
+                return std::tie(dictionary.get(row.path), dictionary.get(row.arrayKey));
+            };
+            std::sort(rows.begin(), rows.end(), [&](const auto& a, const auto& b) { return key(a) < key(b); });
+        }
         Json::Value result(Json::arrayValue);
-        for(auto& row:rows){auto out=structure(dictionary.get(row.path));out["APP_ID"]=dictionary.get(row.app);out["ARRAY_KEY"]=dictionary.get(row.arrayKey);out["SOURCE"]=source;out["VALUE"]=dictionary.get(row.value);out["ADJUSTED_VALUE"]=dictionary.get(row.adjusted);out["VALUE_TYPE"]=typeName(row.type);result.append(out);}
-        validateNormalized(result,app,source);return result;
+        {
+            OperationTimer timer(&PipelineProfile::renderRows);
+            for (const auto& row : rows) {
+                auto out = structure(dictionary.get(row.path));
+                out["APP_ID"] = app;
+                out["ARRAY_KEY"] = dictionary.get(row.arrayKey);
+                out["SOURCE"] = source;
+                out["VALUE"] = dictionary.get(row.value);
+                out["ADJUSTED_VALUE"] = dictionary.get(row.adjusted);
+                out["VALUE_TYPE"] = typeName(row.type);
+                result.append(std::move(out));
+            }
+        }
+        validateNormalized(result, app, source);
+        return result;
     }
 };
 
-std::string normalizedKey(const Json::Value& row){Json::Value k(Json::arrayValue);for(auto name:{"APP_ID","PATH","ARRAY_KEY"})k.append(row[name]);return dump(k);}
-std::vector<FlatRow> nativeRows(const Json::Value& rows,StringInterner& strings){
-    std::vector<FlatRow> out;out.reserve(rows.size());
-    for(auto& row:rows){auto t=parseType(row["VALUE_TYPE"].asString());auto value=row["VALUE"].asString();if(t==ValueType::Number)value=canonicalNumber(value);out.push_back({strings.intern(row["APP_ID"].asString()),strings.intern(row["PATH"].asString()),strings.intern(row["ARRAY_KEY"].asString()),strings.intern(value),strings.intern(row["ADJUSTED_VALUE"].asString()),t,row["SOURCE"].asString()=="AFTER"});}
-    std::sort(out.begin(),out.end(),[](const auto&a,const auto&b){return std::tie(a.app,a.path,a.arrayKey)<std::tie(b.app,b.path,b.arrayKey);});return out;
+// These keys live only during a validation pass. Their bytes are owned by the
+// immutable input rows, so distinct attributes need no allocation or JSON encoding.
+using AttributeIdentity = std::array<std::string_view, 4>;
+struct IdentityHash {
+    size_t operator()(const AttributeIdentity& key) const noexcept {
+        size_t hash = 0;
+        for (auto field : key)
+            hash ^= std::hash<std::string_view>{}(field) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+std::string_view identityField(const Json::Value& field) {
+    const char *begin = nullptr, *end = nullptr;
+    if (!field.getString(&begin, &end)) throw std::runtime_error("Expected a string in attribute identity");
+    return {begin, static_cast<size_t>(end - begin)};
 }
+AttributeIdentity attributeIdentity(const Json::Value& row, std::string_view source = {}) {
+    return {identityField(row["APP_ID"]), identityField(row["PATH"]), identityField(row["ARRAY_KEY"]), source};
+}
+// Dictionary IDs establish equality; their allocation order need not match the display order.
+int compareKeys(const FlatRow& a, const FlatRow& b, const StringInterner& strings) {
+    if (a.app != b.app) return strings.get(a.app).compare(strings.get(b.app));
+    if (a.path != b.path) return strings.get(a.path).compare(strings.get(b.path));
+    if (a.arrayKey != b.arrayKey) return strings.get(a.arrayKey).compare(strings.get(b.arrayKey));
+    return 0;
+}
+
+std::vector<FlatRow> nativeRows(const Json::Value& rows, StringInterner& strings) {
+    std::vector<FlatRow> out;
+    out.reserve(rows.size());
+    for (const auto& row : rows) {
+        auto type = parseType(row["VALUE_TYPE"].asString());
+        auto value = row["VALUE"].asString();
+        if (type == ValueType::Number) value = canonicalNumber(value);
+        out.push_back({strings.intern(row["APP_ID"].asString()), strings.intern(row["PATH"].asString()),
+                       strings.intern(row["ARRAY_KEY"].asString()), strings.intern(value),
+                       strings.intern(row["ADJUSTED_VALUE"].asString()), type, row["SOURCE"] == "AFTER"});
+    }
+    {
+        OperationTimer timer(&PipelineProfile::keySort);
+        auto less = [&](const FlatRow& a, const FlatRow& b) { return compareKeys(a, b, strings) < 0; };
+        if (!std::is_sorted(out.begin(), out.end(), less)) std::sort(out.begin(), out.end(), less);
+    }
+    return out;
+}
+
+template<typename Visitor>
+void mergeNativeRows(const std::vector<FlatRow>& before, const std::vector<FlatRow>& after,
+                     const StringInterner& strings, Visitor visit) {
+    size_t b = 0, a = 0;
+    while (b < before.size() || a < after.size()) {
+        int order;
+        if (b == before.size()) order = 1;
+        else if (a == after.size()) order = -1;
+        else order = compareKeys(before[b], after[a], strings);
+        const FlatRow* left = order <= 0 ? &before[b++] : nullptr;
+        const FlatRow* right = order >= 0 ? &after[a++] : nullptr;
+        bool same = left && right && left->type == right->type && left->value == right->value;
+        if (!visit(left, right, same)) break;
+    }
+}
+
 }
 
 std::string canonicalNumber(const std::string& input){
@@ -218,34 +373,106 @@ Json::Value defaultConfig(){return parse(R"JSON({
 Json::Value normalize(const std::string& raw,const std::string& appId,const std::string& source,const Json::Value& config){return Normalizer(config,appId,source).run(raw);}
 
 void validateNormalized(const Json::Value& rows,const std::string& appId,const std::string& source){
-    if(!rows.isArray())throw std::runtime_error("normalize must return an array");std::unordered_set<std::string> keys;
+    if(!rows.isArray())throw std::runtime_error("normalize must return an array");
+    std::unordered_set<AttributeIdentity, IdentityHash> keys;
+    keys.reserve(rows.size());
     for(auto& row:rows){for(auto name:{"APP_ID","SOURCE","PREFIX","CLASS","SUFFIX","ARRAY_KEY","KEY","PATH","VALUE","ADJUSTED_VALUE","VALUE_TYPE"})if(!row[name].isString())throw std::runtime_error(std::string("Normalized string missing: ")+name);
         if(!appId.empty()&&row["APP_ID"].asString()!=appId)throw std::runtime_error("Normalized APP_ID mismatch");
         auto src=row["SOURCE"].asString();if((src!="BEFORE"&&src!="AFTER")||(!source.empty()&&src!=source))throw std::runtime_error("Normalized SOURCE mismatch");
         auto type=parseType(row["VALUE_TYPE"].asString());auto value=row["VALUE"].asString();if(type==ValueType::Number)canonicalNumber(value);if(type==ValueType::Null&&value!="NULL")throw std::runtime_error("Null VALUE must be NULL");if(type==ValueType::Boolean&&value!="true"&&value!="false")throw std::runtime_error("Invalid boolean VALUE");
-        if(!keys.insert(src+normalizedKey(row)).second)throw std::runtime_error("Duplicate normalized attribute");
+        if(!keys.insert(attributeIdentity(row, identityField(row["SOURCE"]))).second)throw std::runtime_error("Duplicate normalized attribute");
     }
 }
 
-Json::Value compare(const Json::Value& beforeRows,const Json::Value& afterRows,const Json::Value&){
-    validateNormalized(beforeRows,"","BEFORE");validateNormalized(afterRows,"","AFTER");StringInterner strings;
-    auto before=nativeRows(beforeRows,strings),after=nativeRows(afterRows,strings);std::vector<ComparisonRow> compared;compared.reserve(before.size()+after.size());size_t b=0,a=0;
-    auto key=[](const FlatRow&r){return std::tuple{r.app,r.path,r.arrayKey};};
-    while(b<before.size()||a<after.size()){
-        ComparisonRow out;
-        if(a==after.size()||(b<before.size()&&key(before[b])<key(after[a]))){out.before=before[b++];out.hasBefore=true;out.change=3;}
-        else if(b==before.size()||key(after[a])<key(before[b])){out.after=after[a++];out.hasAfter=true;out.change=2;}
-        else {out.before=before[b++];out.after=after[a++];out.hasBefore=out.hasAfter=true;out.change=out.before.type==out.after.type&&out.before.value==out.after.value?0:1;}
-        const auto&r=out.hasBefore?out.before:out.after;out.app=r.app;out.path=r.path;out.arrayKey=r.arrayKey;compared.push_back(out);
+namespace {
+struct ComparisonSide {
+    Json::Value value{Json::StaticString("")};
+    Json::Value adjusted{Json::StaticString("")};
+    Json::Value type{Json::StaticString("")};
+    bool present = false;
+};
+
+void appendComparison(Json::Value& result, Json::Value out, ComparisonSide before, ComparisonSide after) {
+    bool same = before.present && after.present && before.type == after.type && before.value == after.value;
+    out[Json::StaticString("VALUE_BEFORE")] = std::move(before.value);
+    out[Json::StaticString("VALUE_AFTER")] = std::move(after.value);
+    out[Json::StaticString("ADJUSTED_BEFORE")] = std::move(before.adjusted);
+    out[Json::StaticString("ADJUSTED_AFTER")] = std::move(after.adjusted);
+    out[Json::StaticString("TYPE_BEFORE")] = std::move(before.type);
+    out[Json::StaticString("TYPE_AFTER")] = std::move(after.type);
+    out[Json::StaticString("PRESENT_BEFORE")] = before.present;
+    out[Json::StaticString("PRESENT_AFTER")] = after.present;
+    out[Json::StaticString("DIFF_FLAG")] = same ? 0 : 1;
+    const char* change;
+    if (!before.present) change = "ATTRIBUTE_NEW";
+    else if (!after.present) change = "ATTRIBUTE_LOST";
+    else change = same ? "SAME" : "VALUE_CHANGED";
+    out[Json::StaticString("CHANGE_TYPE")] = Json::StaticString(change);
+    result.append(std::move(out));
+}
+
+}
+
+Json::Value compareNormalizedPair(const Json::Value& beforeRows, const Json::Value& afterRows) {
+    // Both sides come from native normalize for the same APP_ID. Their values
+    // are canonical and each side is already sorted by (PATH, ARRAY_KEY).
+    auto before = beforeRows.begin(), after = afterRows.begin();
+    const auto beforeEnd = beforeRows.end(), afterEnd = afterRows.end();
+    Json::Value result(Json::arrayValue);
+    auto fields = [](const Json::Value* row) -> ComparisonSide {
+        if (!row) return {};
+        return {(*row)["VALUE"], (*row)["ADJUSTED_VALUE"], (*row)["VALUE_TYPE"], true};
+    };
+    OperationTimer timer(&PipelineProfile::renderRows);
+    while (before != beforeEnd || after != afterEnd) {
+        int order;
+        if (before == beforeEnd) order = 1;
+        else if (after == afterEnd) order = -1;
+        else {
+            order = identityField((*before)["PATH"]).compare(identityField((*after)["PATH"]));
+            if (order == 0)
+                order = identityField((*before)["ARRAY_KEY"]).compare(identityField((*after)["ARRAY_KEY"]));
+        }
+        const Json::Value* left = order <= 0 ? &*before : nullptr;
+        const Json::Value* right = order >= 0 ? &*after : nullptr;
+        const auto& original = left ? *left : *right;
+        Json::Value out(Json::objectValue);
+        for (const char* field : {"APP_ID", "PATH", "PREFIX", "CLASS", "SUFFIX", "KEY", "ARRAY_KEY"})
+            out[Json::StaticString(field)] = original[field];
+        appendComparison(result, std::move(out), fields(left), fields(right));
+        if (left) ++before;
+        if (right) ++after;
     }
-    std::sort(compared.begin(),compared.end(),[&](const auto& x,const auto& y){return std::tie(strings.get(x.app),strings.get(x.path),strings.get(x.arrayKey)) < std::tie(strings.get(y.app),strings.get(y.path),strings.get(y.arrayKey));});
-    Json::Value result(Json::arrayValue);const char* names[]={"SAME","VALUE_CHANGED","ATTRIBUTE_NEW","ATTRIBUTE_LOST"};
-    for(auto& row:compared){auto out=structure(strings.get(row.path));out["APP_ID"]=strings.get(row.app);out["ARRAY_KEY"]=strings.get(row.arrayKey);out["VALUE_BEFORE"]=row.hasBefore?strings.get(row.before.value):"";out["VALUE_AFTER"]=row.hasAfter?strings.get(row.after.value):"";out["ADJUSTED_BEFORE"]=row.hasBefore?strings.get(row.before.adjusted):"";out["ADJUSTED_AFTER"]=row.hasAfter?strings.get(row.after.adjusted):"";out["PRESENT_BEFORE"]=row.hasBefore;out["PRESENT_AFTER"]=row.hasAfter;out["TYPE_BEFORE"]=row.hasBefore?typeName(row.before.type):"";out["TYPE_AFTER"]=row.hasAfter?typeName(row.after.type):"";out["DIFF_FLAG"]=row.change==0?0:1;out["CHANGE_TYPE"]=names[row.change];result.append(out);}
+    return result;
+}
+
+Json::Value compare(const Json::Value& beforeRows, const Json::Value& afterRows, const Json::Value&) {
+    validateNormalized(beforeRows, "", "BEFORE");
+    validateNormalized(afterRows, "", "AFTER");
+    StringInterner strings;
+    auto before = nativeRows(beforeRows, strings);
+    auto after = nativeRows(afterRows, strings);
+    Json::Value result(Json::arrayValue);
+    OperationTimer timer(&PipelineProfile::renderRows);
+    auto fields = [&](const FlatRow* row) -> ComparisonSide {
+        if (!row) return {};
+        return {strings.get(row->value), strings.get(row->adjusted), typeName(row->type), true};
+    };
+    mergeNativeRows(before, after, strings, [&](const FlatRow* left, const FlatRow* right, bool) {
+        const auto& row = left ? *left : *right;
+        auto out = structure(strings.get(row.path));
+        out["APP_ID"] = strings.get(row.app);
+        out["ARRAY_KEY"] = strings.get(row.arrayKey);
+        appendComparison(result, std::move(out), fields(left), fields(right));
+        return true;
+    });
     return result;
 }
 
 void validateComparison(const Json::Value& rows,const std::string& appId){
-    if(!rows.isArray())throw std::runtime_error("compare must return an array");std::unordered_set<std::string> seen;
+    if(!rows.isArray())throw std::runtime_error("compare must return an array");
+    std::unordered_set<AttributeIdentity, IdentityHash> seen;
+    seen.reserve(rows.size());
     for(auto& row:rows){for(auto n:{"APP_ID","PREFIX","CLASS","SUFFIX","ARRAY_KEY","KEY","PATH","VALUE_BEFORE","VALUE_AFTER","ADJUSTED_BEFORE","ADJUSTED_AFTER","TYPE_BEFORE","TYPE_AFTER","CHANGE_TYPE"})if(!row[n].isString())throw std::runtime_error(std::string("Comparison string missing: ")+n);
         if(!appId.empty()&&row["APP_ID"].asString()!=appId)throw std::runtime_error("Comparison APP_ID mismatch");
         auto type=row["CHANGE_TYPE"].asString();if(type!="SAME"&&type!="VALUE_CHANGED"&&type!="ATTRIBUTE_NEW"&&type!="ATTRIBUTE_LOST")throw std::runtime_error("Invalid CHANGE_TYPE");
@@ -267,7 +494,7 @@ void validateComparison(const Json::Value& rows,const std::string& appId){
             if(bt==ValueType::Number)bv=canonicalNumber(bv);if(at==ValueType::Number)av=canonicalNumber(av);
             if((bt==at&&bv==av)!=(type=="SAME"))throw std::runtime_error("CHANGE_TYPE disagrees with typed original values");
         }
-        if(!seen.insert(normalizedKey(row)).second)throw std::runtime_error("Duplicate comparison attribute");
+        if(!seen.insert(attributeIdentity(row)).second)throw std::runtime_error("Duplicate comparison attribute");
     }
 }
 
@@ -276,8 +503,8 @@ Json::Value segments(const std::string& beforeRaw,const std::string& afterRaw,co
     return segmentsFromNormalized(b,a,appId);
 }
 
-Json::Value segmentsFromNormalized(const Json::Value& b,const Json::Value& a,const std::string& appId){
-    validateNormalized(b,appId,"BEFORE");validateNormalized(a,appId,"AFTER");
+namespace {
+Json::Value segmentFields(const Json::Value& b, const Json::Value& a, const std::string& appId) {
     auto first=[](const Json::Value& rows,const std::string& path){for(auto& r:rows)if(r["PATH"].asString()==path)return r["VALUE"].asString();return std::string();};
     auto collect=[](const Json::Value& rows,const std::string& path){std::set<std::string> result;for(auto& r:rows)if(r["PATH"].asString()==path&&!r["VALUE"].asString().empty())result.insert(r["VALUE"].asString());return result;};
     auto combine=[&](const std::string& path){auto values=collect(b,path),other=collect(a,path);values.insert(other.begin(),other.end());return join(std::vector<std::string>(values.begin(),values.end()),";");};
@@ -311,51 +538,150 @@ Json::Value segmentsFromNormalized(const Json::Value& b,const Json::Value& a,con
         for(auto& r:rows){auto path=r["PATH"].asString(),key=r["ARRAY_KEY"].asString();if(path=="decisionResult.available_offers.product_id")products[key]=r["VALUE"].asString();if(path=="decisionResult.available_offers.rank")ranks[key]=std::stold(r["VALUE"].asString());}
         std::string top;long double rank=std::numeric_limits<long double>::infinity();for(auto& [key,product]:products){auto val=ranks.count(key)?ranks[key]:std::numeric_limits<long double>::max();if(top.empty()||val<rank){rank=val;top=product;}}out["TOP_OFFER"+suffix]=top;
     }
-    // Only two boolean flags are needed here. Merge typed native rows without
-    // materializing a second full comparison JSON for every application.
-    StringInterner dictionary;auto before=nativeRows(b,dictionary),after=nativeRows(a,dictionary);
-    size_t bi=0,ai=0;bool changed=false,external=false;
-    auto key=[](const FlatRow& row){return std::tuple{row.app,row.path,row.arrayKey};};
-    while(bi<before.size()||ai<after.size()){
-        const FlatRow* row=nullptr;bool different=true;
-        if(ai==after.size()||(bi<before.size()&&key(before[bi])<key(after[ai])))row=&before[bi++];
-        else if(bi==before.size()||key(after[ai])<key(before[bi]))row=&after[ai++];
-        else{row=&before[bi];different=before[bi].type!=after[ai].type||before[bi].value!=after[ai].value;++bi;++ai;}
-        if(different){changed=true;const auto& path=dictionary.get(row->path);if(path.rfind("characteristics.",0)==0||path.rfind("ext_data.",0)==0){external=true;break;}}
-    }
-    out["CHANGED"]=changed?1:0;out["EXTERNAL_CHANGED"]=external?1:0;out["INPUT_CHANGED"]=external?1:0;return out;
+    return out;
 }
 
-Json::Value aggregate(const Json::Value& comparisons,const Json::Value& segmentRows,const Json::Value& config){
-    validateComparison(comparisons);std::unordered_map<std::string,const Json::Value*> segmentsByApp;
-    if(!segmentRows.isArray())throw std::runtime_error("Segments must be an array");
-    for(auto& s:segmentRows){if(!s["APP_ID"].isString()||!segmentsByApp.emplace(s["APP_ID"].asString(),&s).second)throw std::runtime_error("Invalid or duplicate segment APP_ID");}
-    auto dims=config.isMember("aggregate_dimensions")?config["aggregate_dimensions"]:defaultConfig()["aggregate_dimensions"];
-    if(!dims.isArray()||dims.empty())throw std::runtime_error("aggregate_dimensions must be a nonempty array");
-    std::set<std::string> dimensions;
-    for(const auto& d:dims){if(!d.isString()||!dimensions.insert(d.asString()).second)throw std::runtime_error("Aggregate dimensions must be unique strings");}
-    StringInterner strings;std::unordered_map<std::string,AggregateFact> groups;
-    for(auto& row:comparisons){auto app=row["APP_ID"].asString();auto seg=segmentsByApp.find(app);if(seg==segmentsByApp.end())throw std::runtime_error("Missing application segment: "+app);
-        for(const std::string side:{"BEFORE","AFTER"}){
-            Json::Value chosen;
-            // Project requested dimensions directly. Copying the whole segment
-            // for each attribute would repeatedly clone all product details.
-            for(const auto& d:dims){
-                auto key=d.asString();
-                if(key=="SOURCE")chosen[key]=side;
-                else if(key=="VALUE_ADJUSTED"||key=="ADJUSTED_VALUE")chosen[key]=row["PRESENT_"+side].asBool()?row["ADJUSTED_"+side]:Json::Value("(отсутствует)");
-                else if(key=="VALUE")chosen[key]=row["PRESENT_"+side].asBool()?row["VALUE_"+side]:Json::Value("(отсутствует)");
-                else if(key=="VALUE_TYPE")chosen[key]=row["TYPE_"+side];
-                else if(seg->second->isMember(key))chosen[key]=(*seg->second)[key];
-                else if(row.isMember(key))chosen[key]=row[key];
-                else throw std::runtime_error("Unsupported aggregate dimension: "+key);
-            }
-            auto key=dump(chosen);auto& group=groups[key];group.dimensions=std::move(chosen);group.applications.push_back(strings.intern(app));
+bool externalPath(const std::string& path) {
+    return path.starts_with("characteristics.") || path.starts_with("ext_data.");
+}
+
+void setChangeFlags(Json::Value& segment, bool changed, bool external) {
+    segment["CHANGED"] = changed ? 1 : 0;
+    segment["EXTERNAL_CHANGED"] = external ? 1 : 0;
+    segment["INPUT_CHANGED"] = external ? 1 : 0;
+}
+}
+
+Json::Value segmentsFromNormalized(const Json::Value& b, const Json::Value& a, const std::string& appId) {
+    validateNormalized(b, appId, "BEFORE");
+    validateNormalized(a, appId, "AFTER");
+    auto segment = segmentFields(b, a, appId);
+    StringInterner strings;
+    auto before = nativeRows(b, strings);
+    auto after = nativeRows(a, strings);
+    bool changed = false, external = false;
+    mergeNativeRows(before, after, strings, [&](const FlatRow* left, const FlatRow* right, bool same) {
+        if (!same) {
+            changed = true;
+            external = externalPath(strings.get((left ? left : right)->path));
         }
+        return !external;
+    });
+    setChangeFlags(segment, changed, external);
+    return segment;
+}
+
+Json::Value segmentsFromNormalized(const Json::Value& b, const Json::Value& a, const std::string& appId,
+                                   const Json::Value& comparisons) {
+    // Both inputs have been validated by normalize or compare. Segments require
+    // all their rows to belong to the requested application.
+    if (!appId.empty()) {
+        for (const auto* rows : {&b, &a})
+            for (const auto& row : *rows)
+                if (row["APP_ID"].asString() != appId) throw std::runtime_error("Normalized APP_ID mismatch");
     }
-    std::vector<std::string> keys;for(auto& pair:groups)keys.push_back(pair.first);std::sort(keys.begin(),keys.end());Json::Value result(Json::arrayValue);size_t index=0;
-    for(auto& key:keys){auto& group=groups[key];auto& ids=group.applications;std::sort(ids.begin(),ids.end());ids.erase(std::unique(ids.begin(),ids.end()),ids.end());auto fact=group.dimensions;fact["CNT"]=Json::UInt64(ids.size());fact["counts"]=Json::UInt64(ids.size());fact["id"]=Json::UInt64(++index);std::vector<std::string> appIds;for(auto id:ids)appIds.push_back(strings.get(id));std::sort(appIds.begin(),appIds.end());fact["APP_IDS"]=Json::arrayValue;for(auto& id:appIds)fact["APP_IDS"].append(id);result.append(fact);}
+    auto segment = segmentFields(b, a, appId);
+    bool changed = false, external = false;
+    for (const auto& row : comparisons) {
+        if (!row["DIFF_FLAG"].asInt()) continue;
+        changed = true;
+        if (externalPath(row["PATH"].asString())) { external = true; break; }
+    }
+    setChangeFlags(segment, changed, external);
+    return segment;
+}
+
+Json::Value aggregateBatches(const ComparisonSource& produce, const Json::Value& segmentRows,
+                             const Json::Value& config) {
+    if (!segmentRows.isArray()) throw std::runtime_error("Segments must be an array");
+    std::unordered_map<std::string, const Json::Value*> segmentsByApp;
+    segmentsByApp.reserve(segmentRows.size());
+    for (const auto& segment : segmentRows) {
+        const auto& app = segment["APP_ID"];
+        if (!app.isString() || !segmentsByApp.emplace(app.asString(), &segment).second)
+            throw std::runtime_error("Invalid or duplicate segment APP_ID");
+    }
+
+    auto dims = config.isMember("aggregate_dimensions")
+        ? config["aggregate_dimensions"] : defaultConfig()["aggregate_dimensions"];
+    if (!dims.isArray() || dims.empty())
+        throw std::runtime_error("aggregate_dimensions must be a nonempty array");
+    std::vector<std::string> dimensions;
+    dimensions.reserve(dims.size());
+    std::unordered_set<std::string> seenDimensions;
+    for (const auto& dim : dims) {
+        if (!dim.isString() || !seenDimensions.insert(dim.asString()).second)
+            throw std::runtime_error("Aggregate dimensions must be unique strings");
+        dimensions.push_back(dim.asString());
+    }
+
+    struct Side {
+        const char *name, *present, *adjusted, *value, *type;
+    };
+    constexpr Side sides[] = {
+        {"BEFORE", "PRESENT_BEFORE", "ADJUSTED_BEFORE", "VALUE_BEFORE", "TYPE_BEFORE"},
+        {"AFTER",  "PRESENT_AFTER",  "ADJUSTED_AFTER",  "VALUE_AFTER",  "TYPE_AFTER"},
+    };
+    const Json::Value missing("(отсутствует)");
+    StringInterner strings;
+    std::unordered_map<std::string, AggregateFact> groups;
+    produce([&](const Json::Value& comparisons) {
+        validateComparison(comparisons);
+        for (const auto& row : comparisons) {
+            auto app = row["APP_ID"].asString();
+            auto segment = segmentsByApp.find(app);
+            if (segment == segmentsByApp.end()) throw std::runtime_error("Missing application segment: " + app);
+            auto id = strings.intern(app);
+            for (const auto& side : sides) {
+                Json::Value chosen;
+                // Copy only requested dimensions. Segments may contain entire product detail tables.
+                for (const auto& key : dimensions) {
+                    if (key == "SOURCE") chosen[key] = side.name;
+                    else if (key == "VALUE_ADJUSTED" || key == "ADJUSTED_VALUE")
+                        chosen[key] = row[side.present].asBool() ? row[side.adjusted] : missing;
+                    else if (key == "VALUE")
+                        chosen[key] = row[side.present].asBool() ? row[side.value] : missing;
+                    else if (key == "VALUE_TYPE") chosen[key] = row[side.type];
+                    else if (auto field = segment->second->find(key.data(), key.data() + key.size()))
+                        chosen[key] = *field;
+                    else if (auto field = row.find(key.data(), key.data() + key.size()))
+                        chosen[key] = *field;
+                    else throw std::runtime_error("Unsupported aggregate dimension: " + key);
+                }
+                auto [entry, inserted] = groups.try_emplace(dump(chosen));
+                auto& group = entry->second;
+                if (inserted) group.dimensions = std::move(chosen);
+                if (group.applications.empty() || group.applications.back() != id)
+                    group.applications.push_back(id);
+            }
+        }
+    });
+
+    // Sort pointers to the stored groups; copying their serialized keys can duplicate large dimensions.
+    std::vector<decltype(groups)::value_type*> ordered;
+    ordered.reserve(groups.size());
+    for (auto& entry : groups) ordered.push_back(&entry);
+    std::sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b) { return a->first < b->first; });
+
+    Json::Value result(Json::arrayValue);
+    for (auto* entry : ordered) {
+        auto& group = entry->second;
+        auto& ids = group.applications;
+        std::sort(ids.begin(), ids.end(), [&](auto a, auto b) { return strings.get(a) < strings.get(b); });
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        auto fact = std::move(group.dimensions);
+        fact["CNT"] = Json::UInt64(ids.size());
+        fact["counts"] = fact["CNT"];
+        fact["id"] = Json::UInt64(result.size()) + 1;
+        fact["APP_IDS"] = Json::arrayValue;
+        for (auto id : ids) fact["APP_IDS"].append(strings.get(id));
+        result.append(std::move(fact));
+    }
     return result;
+}
+
+Json::Value aggregate(const Json::Value& comparisons, const Json::Value& segments, const Json::Value& config) {
+    return aggregateBatches([&](const ComparisonBatch& accept) { accept(comparisons); }, segments, config);
 }
 void validateFacts(const Json::Value& facts){if(!facts.isArray())throw std::runtime_error("aggregate must return an array");for(auto& fact:facts){if(!fact["APP_IDS"].isArray()||!fact["CNT"].isUInt64())throw std::runtime_error("Fact requires APP_IDS and integer CNT");std::set<std::string> ids;for(auto& id:fact["APP_IDS"]){if(!id.isString())throw std::runtime_error("APP_IDS must be strings");ids.insert(id.asString());}if(ids.size()!=fact["APP_IDS"].size()||ids.size()!=fact["CNT"].asUInt64())throw std::runtime_error("CNT must equal unique APP_IDS without duplicate members");if(fact.isMember("counts")&&(!fact["counts"].isUInt64()||fact["counts"].asUInt64()!=fact["CNT"].asUInt64()))throw std::runtime_error("counts must equal CNT");if(fact.isMember("SOURCE")&&fact["SOURCE"]!="BEFORE"&&fact["SOURCE"]!="AFTER")throw std::runtime_error("Invalid fact SOURCE");}}
 }

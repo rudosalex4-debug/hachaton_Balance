@@ -69,6 +69,26 @@ TEST(Normalize,LongNumbersAndMalformedNumberGrammar){
  for(const auto& s:{"", "-", "01", "1.", ".1", "1e", "1e+", "NaN", "+1", "--1"})
  EXPECT_THROW(lens::canonicalNumber(s),std::exception);
 }
+
+TEST(Normalize,CompiledIntervalsPreserveGlobOrderTypesAndDocumentScope) {
+    auto config = lens::defaultConfig();
+    config["array_rules"]["items"] = "BY_INDEX";
+    config["bucket_rules"] = parsed(R"({"*.v":["-10","-1.01","-1",0,1,"1.01",10],"items.v":[],"unused":[]})");
+    auto raw = R"({"items":[{"v":-10},{"v":-1.011},{"v":-1},{"v":-0.01},{"v":0},{"v":1.001},{"v":1.01},{"v":11},{"v":"1.01"},{"v":null}]})";
+    auto rows = lens::normalize(raw, "A", "BEFORE", config);
+    ASSERT_EQ(rows.size(), 10u);
+    const char* expected[] = {"(-inf; -10]", "(-10; -1.01]", "(-1.01; -1]", "(-1; 0]", "(-1; 0]",
+                              "(1; 1.01]", "(1; 1.01]", "(10; +inf)", "1.01", "NULL"};
+    for (Json::ArrayIndex i = 0; i < rows.size(); ++i) EXPECT_EQ(rows[i]["ADJUSTED_VALUE"], expected[i]);
+
+    config["bucket_rules"]["*.v"] = parsed("[1]");
+    auto next = lens::normalize(raw, "A", "AFTER", config);
+    EXPECT_EQ(next[0]["ADJUSTED_VALUE"], "(-inf; 1]");
+    EXPECT_EQ(next[6]["ADJUSTED_VALUE"], "(1; +inf)");
+    config["bucket_rules"]["*.v"] = parsed("[1,1.0]");
+    EXPECT_THROW(lens::normalize(raw, "A", "AFTER", config), std::exception);
+    EXPECT_NO_THROW(lens::normalize(R"({"items":[{"v":"1"}],"other":3})", "A", "AFTER", config));
+}
 TEST(Contracts,RejectSemanticallyInconsistentComparison){
  auto rows=diff(R"({"a":1})",R"({"a":2})");rows[0]["CHANGE_TYPE"]="SAME";rows[0]["DIFF_FLAG"]=0;
  
