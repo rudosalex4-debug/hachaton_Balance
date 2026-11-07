@@ -9,13 +9,13 @@ export default function CodeEditor({value,onChange,readOnly=false}:{value:string
  callback.current=onChange;
  useEffect(()=>{
   if(!element.current)return;
-  monaco.editor.defineTheme('decision-lens',{
-   base:'vs-dark',inherit:true,
-   rules:[{token:'keyword',foreground:'B98AFF'},{token:'string',foreground:'8DE279'},{token:'number',foreground:'FFBF69'},{token:'comment',foreground:'93959F'}],
-   colors:{'editor.background':'#1C1D20','editor.foreground':'#F5F5F6','editorLineNumber.foreground':'#858792','editorLineNumber.activeForeground':'#6CDB57','editorCursor.foreground':'#6CDB57','editor.selectionBackground':'#704C9C66','editor.lineHighlightBackground':'#FFFFFF05'}
+  monaco.editor.defineTheme('balance-platform',{
+   base:'vs',inherit:true,
+   rules:[{token:'keyword',foreground:'783DD0'},{token:'string',foreground:'287C1B'},{token:'number',foreground:'975809'},{token:'comment',foreground:'727984'}],
+   colors:{'editor.background':'#FFFFFF','editor.foreground':'#20232B','editorLineNumber.foreground':'#727984','editorLineNumber.activeForeground':'#287C1B','editorCursor.foreground':'#287C1B','editor.selectionBackground':'#DCCAF666','editor.lineHighlightBackground':'#F7F8FA'}
   });
   const model=monaco.editor.createModel(value,'python');
-  const instance=monaco.editor.create(element.current,{model,theme:'decision-lens',automaticLayout:true,minimap:{enabled:false},fontSize:13,lineHeight:21,scrollBeyondLastLine:false,readOnly,tabSize:4,wordWrap:'off',padding:{top:14},ariaLabel:'Редактор процедуры Python'});
+  const instance=monaco.editor.create(element.current,{model,theme:'balance-platform',automaticLayout:true,minimap:{enabled:false},fontSize:13,lineHeight:21,scrollBeyondLastLine:false,readOnly,tabSize:4,wordWrap:'off',padding:{top:14},ariaLabel:'Редактор процедуры Python'});
   editor.current=instance;
   const change=model.onDidChangeContent(()=>callback.current(model.getValue()));
   return()=>{change.dispose();instance.dispose();model.dispose();editor.current=null;};
