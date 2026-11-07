@@ -8,13 +8,25 @@ import {chromium} from 'playwright-core';
 
 // Browser interaction tests use an explicit API fixture. They do not replace backend integration tests.
 test('report, checks, pivot, configuration and stable-link browser flows', {timeout:120000}, async()=>{
- const capture=async(name)=>{if(process.env.UI_ARTIFACT_DIR){await mkdir(process.env.UI_ARTIFACT_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.UI_ARTIFACT_DIR,name+'.png'),fullPage:true});}};
+ const capture=async(name)=>{if(process.env.UI_ARTIFACT_DIR){await mkdir(process.env.UI_ARTIFACT_DIR,{recursive:true});await page.screenshot({path:path.join(process.env.UI_ARTIFACT_DIR,name+'.png'),fullPage:true,animations:'disabled'});}};
  const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),dist=path.join(root,'dist');
  await stat(path.join(dist,'index.html'));
- const server=createServer(async(req,res)=>{try{const url=new URL(req.url,'http://localhost'),relative=decodeURIComponent(url.pathname).replace(/^\/+/,''),file=path.resolve(dist,relative||'index.html');if(!file.startsWith(dist+path.sep)){res.writeHead(403).end();return;}const content=await readFile(file);const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml'}[path.extname(file)]||'application/octet-stream';res.writeHead(200,{'Content-Type':mime});res.end(content);}catch{res.writeHead(404).end();}});
+ // Serve the attachment over HTTP: browser downloads can bypass page.route interception.
+ const server=createServer(async(req,res)=>{try{const url=new URL(req.url,'http://localhost');if(url.pathname==='/api/v1/runs/aa11/report.html'){res.writeHead(200,{'Content-Type':'text/html','Content-Disposition':'attachment; filename="report-aa11.html"'}).end('<!doctype html><html><body>Mock exported report</body></html>');return;}const relative=decodeURIComponent(url.pathname).replace(/^\/+/,''),file=path.resolve(dist,relative||'index.html');if(!file.startsWith(dist+path.sep)){res.writeHead(403).end();return;}const content=await readFile(file);const mime={'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.woff2':'font/woff2'}[path.extname(file)]||'application/octet-stream';res.writeHead(200,{'Content-Type':mime});res.end(content);}catch{res.writeHead(404).end();}});
  await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const url=`http://127.0.0.1:${server.address().port}`;
  const browser=await chromium.launch(process.env.BROWSER_EXECUTABLE?{executablePath:process.env.BROWSER_EXECUTABLE,headless:true}:{channel:'msedge',headless:true});
  const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors=[],requests=[];page.on('pageerror',error=>errors.push(error.message));
+ const assertFitsViewport=async(name)=>{
+  await page.evaluate(()=>document.fonts.ready);
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  const size=await page.evaluate(()=>({content:document.documentElement.scrollWidth,viewport:innerWidth}));
+  assert.ok(size.content<=size.viewport,`${name}: horizontal overflow (${size.content}px > ${size.viewport}px)`);
+ };
+ const captureResponsive=async(name)=>{
+  await page.setViewportSize({width:1440,height:1000});await assertFitsViewport(name);await capture(name);
+  await page.setViewportSize({width:390,height:844});await assertFitsViewport(name+'-mobile');await capture(name+'-mobile');
+  await page.setViewportSize({width:1440,height:1000});
+ };
  const settings={exclude_paths:[],array_rules:{},bucket_rules:{},aggregate_dimensions:['PATH','SOURCE','VALUE_ADJUSTED']};
  const stageProcedures=['normalize','compare','aggregate'].map(kind=>({id:kind,name:kind,kind,mode:'native'}));
  const checks=Array.from({length:5},(_,i)=>({id:`c${i+1}`,name:`Проверка ${i+1}`,kind:'check',params:{threshold:0.1,app_ids_limit:20},mode:'python',code:'def run(mart, params):\n    return []\nCHECK={"id":"test","label":"Test","params":{},"entrypoint":run}\n'}));
@@ -40,7 +52,7 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   else if(p==='/runs/bb22')data={run:{...run,id:'bb22',status:'running',stage:'checking',progress:95}};
   else if(p.endsWith('/logs'))data={logs:[{created_at:run.created_at,stage:'checking',message:'Проверки выполняются',procedure_id:'c1'}]};
   else if(p==='/runs/aa11/report')data={run_id:run.id,summary:run.summary,checks,checks_summary:{total:3,pass:1,fail:2,low_confidence:1,checks:5}};
-  else if(p==='/runs/aa11/report.html'){await route.fulfill({contentType:'text/html',headers:{'Content-Disposition':'attachment; filename="report-aa11.html"'},body:'<!doctype html><html><body>Mock exported report</body></html>'});return;}
+  else if(p==='/runs/aa11/report.html'){await route.continue();return;}
   else if(p==='/runs/aa11/checks'){const filtered=rows.filter(r=>(!u.searchParams.get('result')||r.RESULT===u.searchParams.get('result'))&&(!u.searchParams.get('confidence')||r.CONFIDENCE===u.searchParams.get('confidence'))&&(!u.searchParams.get('check_id')||r.check_id===u.searchParams.get('check_id')));data={items:filtered,total:filtered.length};}
   else if(p==='/runs/aa11/query'||p==='/runs/aa11/query/apps'){
    const filtered=contexts.filter(r=>Object.entries(body.filters||{}).every(([k,v])=>JSON.stringify(r[k])===JSON.stringify(v)));
@@ -54,7 +66,7 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
  });
  try{
   // The report URL survives login unchanged.
-  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByLabel('Имя пользователя').fill('analyst');await page.getByLabel('Пароль',{exact:true}).fill('test-password');await page.getByRole('button',{name:'Войти в пространство →'}).click();await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();assert.equal(new URL(page.url()).searchParams.get('tab'),'report');
+  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByLabel('Имя пользователя').waitFor();await captureResponsive('auth');await page.getByLabel('Имя пользователя').fill('analyst');await page.getByLabel('Пароль',{exact:true}).fill('test-password');await page.getByRole('button',{name:'Войти →'}).click();await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();assert.equal(new URL(page.url()).searchParams.get('tab'),'report');
   assert.match(await page.locator('.metric').nth(3).innerText(),/3/);assert.equal(await page.locator('.checks-table .low-row').count(),1);
   const downloadPromise=page.waitForEvent('download');await page.getByRole('link',{name:'Скачать HTML ↓'}).click();const download=await downloadPromise;assert.match(download.suggestedFilename(),/\.html$/);assert.equal(await download.failure(),null);
   await page.getByRole('button',{name:'1 примеров ↗'}).first().click();await page.getByRole('region',{name:'Заявки проверки'}).waitFor();assert.match(await page.getByRole('region',{name:'Заявки проверки'}).innerText(),/не является полным/);await page.getByRole('link',{name:'I1001 ↗'}).click();await page.getByRole('cell',{name:'0.6 NUMBER',exact:true}).waitFor();
@@ -67,6 +79,26 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   await page.goto(`${url}/#configs/new`);await page.getByRole('heading',{name:'Новая конфигурация',exact:true}).waitFor();assert.equal(await page.locator('.check-selection input[type=checkbox]:checked').count(),5);await page.locator('.check-option summary').first().click();await page.locator('.check-option textarea').first().fill('{"threshold":0.2,"app_ids_limit":1}');await page.getByRole('button',{name:'Сохранить',exact:true}).click();await page.waitForURL('**/#configs/new-config');assert.equal(configs.at(-1).checks.length,5);assert.equal(configs.at(-1).checks[0].params.threshold,0.2);
   await page.goto(`${url}/#procedures/new`);await page.getByLabel('Этап',{exact:true}).selectOption('check');await page.locator('.monaco-editor').waitFor();await page.getByRole('button',{name:'Сохранить свою процедуру'}).click();await page.waitForURL('**/#procedures/new-check');assert.equal(procedures.at(-1).kind,'check');assert.equal(procedures.at(-1).code,templates.check);
   await page.goto(`${url}/?run=bb22&tab=report`);await page.getByRole('heading',{name:'Журнал этапов'}).waitFor();assert.equal(await page.getByRole('link',{name:'Скачать HTML ↓'}).count(),0);assert(!requests.some(r=>r.p==='/runs/bb22/report'));
-  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();await capture('report');await page.setViewportSize({width:390,height:844});await capture('report-mobile');assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);assert.deepEqual(errors,[]);
+  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();await captureResponsive('report');
+  // Exercise every primary screen at desktop and phone widths with the same explicit fixtures.
+  for(const [name,route,heading] of [
+   ['runs','#runs','Запуски обработки'],
+   ['configs','#configs/legacy','Настроить конфигурацию'],
+   ['datasets','#datasets','Датасеты'],
+   ['procedures','#procedures/new-check','Процедуры обработки']
+  ]){
+   await page.goto(`${url}/${route}`);await page.getByRole('heading',{name:heading,exact:true}).waitFor();
+   if(name==='procedures')await page.locator('.monaco-editor').waitFor();
+   await captureResponsive(name);
+  }
+  // The mobile drawer announces its state and closes after navigation.
+  await page.goto(`${url}/#runs`);await page.getByRole('heading',{name:'Запуски обработки',exact:true}).waitFor();
+  await page.setViewportSize({width:390,height:844});
+  const menuToggle=page.locator('.menu-toggle');assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');
+  await menuToggle.click();assert.equal(await menuToggle.getAttribute('aria-expanded'),'true');await page.keyboard.press('Escape');assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');
+  await menuToggle.click();assert.equal(await menuToggle.getAttribute('aria-expanded'),'true');await capture('navigation-mobile');
+  await page.locator('.nav-link').filter({hasText:'Датасеты'}).click();await page.getByRole('heading',{name:'Датасеты',exact:true}).waitFor();
+  assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');await assertFitsViewport('mobile navigation');
+  assert.deepEqual(errors,[]);
  }catch(error){await capture('failure');console.error('Browser errors:',errors,'Last requests:',requests.slice(-8),'Page:',(await page.locator('body').innerText()).slice(0,1500));throw error;}finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
