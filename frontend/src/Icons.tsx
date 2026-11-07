@@ -1,5 +1,14 @@
 export function BrandMark() {
-  return <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="m16 3 12 13-12 13L4 16 16 3Z" stroke="currentColor" strokeWidth="2"/><path d="m16 10 6 6-6 6-6-6 6-6Z" fill="currentColor"/></svg>;
+  return <svg viewBox="0 0 40 40" fill="none" aria-hidden="true">
+    <path d="M9 14C4 12 4 5 9 5c3 0 5 2 6 5h10c1-3 3-5 6-5 5 0 5 7 0 9" fill="var(--accent, #6cdb57)" stroke="currentColor" strokeWidth="1.8"/>
+    <path d="M9 11c-2-2-1-4 1-3l2 3m16 0 2-3c2-1 3 1 1 3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
+    <path d="M20 8C10 8 5 14 5 23c0 8 7 13 15 14 8-1 15-6 15-14 0-9-5-15-15-15Z" fill="var(--accent, #6cdb57)" stroke="currentColor" strokeWidth="1.8"/>
+    <path d="m17 9 3 8 3-8M9 14l7 4-3-6m18 2-7 4 3-6M5 20l7 3-7 2m30-5-7 3 7 2M7 29l6-2-3 6m23-4-6-2 3 6" fill="currentColor"/>
+    <path d="M13 27c0-3 4-5 7-3 3-2 7 0 7 3 0 5-4 8-7 8s-7-3-7-8Z" fill="#e9f9e4"/>
+    <path d="m11.5 20 4 1m9 0 4-1" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    <path d="m17 26 3 3 3-3c-1-2-5-2-6 0Z" fill="currentColor"/>
+    <path d="M20 29v2m-4 0c1 2 3 2 4 0 1 2 3 2 4 0" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+  </svg>;
 }
 
 export function NavIcon({name}:{name:string}) {

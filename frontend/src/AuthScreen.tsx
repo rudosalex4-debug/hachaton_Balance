@@ -1,6 +1,7 @@
 import type {FormEvent, ReactNode} from 'react';
 import './auth.css';
 import {BrandMark} from './Icons';
+import {ThemeToggle} from './Theme';
 
 type AuthScreenProps = {
   register: boolean;
@@ -14,14 +15,12 @@ function ComparisonGraphic() {
   return <div className="access-graphic" aria-hidden="true">
     <div className="access-orbit"/>
     <div className="access-data-panel access-data-before">
-      <div className="access-data-label"><span className="access-data-dot"/>BEFORE <b>MASTER</b></div>
+      <div className="access-data-label"><span className="access-data-dot"/>Исходный срез</div>
       <div className="access-data-grid">{Array.from({length:28}, (_, i) => <i key={i} className={i % 5 === 0 ? 'highlight' : ''}/>)}</div>
-      <div className="access-data-bottom"><span>01 / ИСХОДНЫЙ СРЕЗ</span><span>↗</span></div>
     </div>
     <div className="access-data-panel access-data-after">
-      <div className="access-data-label"><span className="access-data-dot"/>AFTER <b>BETA</b></div>
+      <div className="access-data-label"><span className="access-data-dot"/>Новый срез</div>
       <div className="access-data-grid">{Array.from({length:28}, (_, i) => <i key={i} className={[2,5,9,10,16,20,23,26].includes(i) ? 'highlight' : ''}/>)}</div>
-      <div className="access-data-bottom"><span>02 / НОВЫЙ СРЕЗ</span><span>↗</span></div>
     </div>
     <div className="access-compare-mark">⇄</div>
   </div>;
@@ -29,22 +28,18 @@ function ComparisonGraphic() {
 
 export default function AuthScreen({register,pending,error,onToggle,onSubmit}: AuthScreenProps) {
   return <main className="access-page">
-    <header className="access-header">
-      <div className="access-brand"><span className="access-brand-symbol" aria-hidden="true"><BrandMark/></span><span>balance platform<small>АНАЛИТИКА РЕШЕНИЙ</small></span></div>
-      <span className="access-header-note">Сравнение результатов СПР</span>
-    </header>
+    <header className="app-header access-header"><div className="header-brand">
+      <div className="access-brand"><span className="access-brand-symbol" aria-hidden="true"><BrandMark/></span><span>balance platform</span></div>
+      <ThemeToggle/>
+    </div></header>
     <div className="access-layout">
       <section className="access-story" aria-labelledby="access-title">
-        <div className="access-eyebrow"><span/>ОБРАБОТКА РЕЗУЛЬТАТОВ СПР</div>
         <h1 id="access-title">Сравнение<br/><em>решений СПР</em></h1>
-        <p className="access-description">Загрузите срезы MASTER и BETA, настройте обработку и изучите изменения атрибутов, решений и результатов проверок.</p>
+        <p className="access-description">Загрузите два среза данных и изучите изменения атрибутов и решений.</p>
         <ComparisonGraphic/>
-        <div className="access-stages"><span><b>01</b> Приведение</span><i>→</i><span><b>02</b> Сравнение</span><i>→</i><span><b>03</b> Агрегация</span><i>→</i><span><b>04</b> Проверки</span></div>
       </section>
       <section className="access-form-side" aria-labelledby="access-form-title">
         <div className="access-form-card">
-          <div className="access-form-icon" aria-hidden="true">↗</div>
-          <div className="access-eyebrow">РАБОЧЕЕ ПРОСТРАНСТВО</div>
           <h2 id="access-form-title">{register?'Регистрация':'Вход'}</h2>
           <p className="access-form-description">{register?'Задайте имя пользователя и пароль.':'Укажите имя пользователя и пароль.'}</p>
           <form onSubmit={onSubmit}>
@@ -57,6 +52,5 @@ export default function AuthScreen({register,pending,error,onToggle,onSubmit}: A
         </div>
       </section>
     </div>
-    <footer className="access-footer"><span>balance platform</span><span>MASTER → BETA</span></footer>
   </main>;
 }

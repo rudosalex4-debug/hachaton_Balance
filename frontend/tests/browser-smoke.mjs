@@ -22,7 +22,20 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   const size=await page.evaluate(()=>({content:document.documentElement.scrollWidth,viewport:innerWidth}));
   assert.ok(size.content<=size.viewport,`${name}: horizontal overflow (${size.content}px > ${size.viewport}px)`);
  };
+ const themeSwitch=()=>page.getByRole('switch',{name:'Тёмная тема',exact:true});
+ const assertTheme=async(dark,{persisted=true}={})=>{
+  await themeSwitch().waitFor({state:'visible'});
+  assert.equal(await themeSwitch().getAttribute('aria-checked'),String(dark));
+  if(persisted)assert.equal(await page.evaluate(()=>localStorage.getItem('balance-platform-theme')),dark?'dark':'light');
+ };
+ const setTheme=async(dark)=>{
+  if(await themeSwitch().getAttribute('aria-checked')!==String(dark))await themeSwitch().click();
+  await assertTheme(dark);
+ };
  const captureResponsive=async(name)=>{
+  await themeSwitch().waitFor({state:'visible'});
+  assert.doesNotMatch(await page.locator('body').innerText(),/MASTER|BETA/i);
+
   await page.setViewportSize({width:1440,height:1000});await assertFitsViewport(name);await capture(name);
   await page.setViewportSize({width:390,height:844});await assertFitsViewport(name+'-mobile');await capture(name+'-mobile');
   await page.setViewportSize({width:1440,height:1000});
@@ -40,6 +53,7 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   const req=route.request(),u=new URL(req.url()),p=u.pathname.replace('/api/v1',''),body=req.postDataJSON();requests.push({p,body,query:u.searchParams.toString()});let data={};
   if(p==='/me')data={user:authenticated?{username:'analyst'}:null};
   else if(p==='/login'){authenticated=true;data={user:{username:'analyst'}};}
+  else if(p==='/logout'){authenticated=false;data={};}
   else if(p==='/datasets')data={datasets:[{id:'ds1',name:'Исходный набор',applications:20,files:40,path:'/data/RUN'}]};
   else if(p==='/defaults')data={settings};
   else if(p==='/procedure-templates')data=templates;
@@ -66,7 +80,18 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
  });
  try{
   // The report URL survives login unchanged.
-  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByLabel('Имя пользователя').waitFor();await captureResponsive('auth');await page.getByLabel('Имя пользователя').fill('analyst');await page.getByLabel('Пароль',{exact:true}).fill('test-password');await page.getByRole('button',{name:'Войти →'}).click();await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();assert.equal(new URL(page.url()).searchParams.get('tab'),'report');
+  await page.goto(`${url}/?run=aa11&tab=report`);await page.getByLabel('Имя пользователя').waitFor();
+  // Light is the first-visit default. The choice survives reload and authentication.
+  await assertTheme(false,{persisted:false});await captureResponsive('auth');
+  const lightBackground=await page.locator('body').evaluate(element=>getComputedStyle(element).backgroundColor);
+  await setTheme(true);await captureResponsive('auth-dark');
+  assert.notEqual(await page.locator('body').evaluate(element=>getComputedStyle(element).backgroundColor),lightBackground,'Theme switch must change the rendered page palette');
+  await page.reload();await page.getByLabel('Имя пользователя').waitFor();await assertTheme(true);
+  await page.getByLabel('Имя пользователя').fill('analyst');await page.getByLabel('Пароль',{exact:true}).fill('test-password');await page.getByRole('button',{name:'Войти →'}).click();await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();assert.equal(new URL(page.url()).searchParams.get('tab'),'report');
+  await assertTheme(true);await setTheme(false);
+  assert.equal(await page.locator('.topbar').count(),0);
+  assert.equal(await page.locator('.header-brand .theme-toggle').innerText(),'');
+  assert.equal(await page.getByRole('button',{name:'Аккаунт',exact:true}).innerText(),'');
   assert.match(await page.locator('.metric').nth(3).innerText(),/3/);assert.equal(await page.locator('.checks-table .low-row').count(),1);
   const downloadPromise=page.waitForEvent('download');await page.getByRole('link',{name:'Скачать HTML ↓'}).click();const download=await downloadPromise;assert.match(download.suggestedFilename(),/\.html$/);assert.equal(await download.failure(),null);
   await page.getByRole('button',{name:'1 примеров ↗'}).first().click();await page.getByRole('region',{name:'Заявки проверки'}).waitFor();assert.match(await page.getByRole('region',{name:'Заявки проверки'}).innerText(),/не является полным/);await page.getByRole('link',{name:'I1001 ↗'}).click();await page.getByRole('cell',{name:'0.6 NUMBER',exact:true}).waitFor();
@@ -77,7 +102,17 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   await page.getByRole('button',{name:'Поменять оси ⇄'}).click();await page.waitForTimeout(150);assert.deepEqual(requests.filter(r=>r.p.endsWith('/query')).at(-1).body.dimensions,['SOURCE','PATH']);
   await page.goto(`${url}/#configs/legacy`);await page.getByRole('heading',{name:'Настроить конфигурацию'}).waitFor();assert.equal(await page.locator('.check-selection input[type=checkbox]:checked').count(),0);
   await page.goto(`${url}/#configs/new`);await page.getByRole('heading',{name:'Новая конфигурация',exact:true}).waitFor();assert.equal(await page.locator('.check-selection input[type=checkbox]:checked').count(),5);await page.locator('.check-option summary').first().click();await page.locator('.check-option textarea').first().fill('{"threshold":0.2,"app_ids_limit":1}');await page.getByRole('button',{name:'Сохранить',exact:true}).click();await page.waitForURL('**/#configs/new-config');assert.equal(configs.at(-1).checks.length,5);assert.equal(configs.at(-1).checks[0].params.threshold,0.2);
-  await page.goto(`${url}/#procedures/new`);await page.getByLabel('Этап',{exact:true}).selectOption('check');await page.locator('.monaco-editor').waitFor();await page.getByRole('button',{name:'Сохранить свою процедуру'}).click();await page.waitForURL('**/#procedures/new-check');assert.equal(procedures.at(-1).kind,'check');assert.equal(procedures.at(-1).code,templates.check);
+  await page.goto(`${url}/#procedures/new`);await page.getByLabel('Этап',{exact:true}).selectOption('check');await page.locator('.monaco-editor').waitFor();
+  // Change theme while a real unsaved editor draft exists; use the editor UI and submitted payload.
+  const draftComment='# theme_switch_keeps_draft';
+  await page.locator('.monaco-editor textarea.inputarea').focus();await page.keyboard.press('Control+Home');await page.keyboard.type(draftComment);await page.keyboard.press('Enter');
+  assert.match(await page.locator('.monaco-editor .view-lines').innerText(),/theme_switch_keeps_draft/);
+  const lightEditorBackground=await page.locator('.monaco-editor').evaluate(element=>getComputedStyle(element).backgroundColor);
+  await setTheme(true);await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+  assert.match(await page.locator('.monaco-editor .view-lines').innerText(),/theme_switch_keeps_draft/);
+  assert.notEqual(await page.locator('.monaco-editor').evaluate(element=>getComputedStyle(element).backgroundColor),lightEditorBackground,'Editor palette must follow the selected theme');
+  await setTheme(false);assert.match(await page.locator('.monaco-editor .view-lines').innerText(),/theme_switch_keeps_draft/);
+  await page.getByRole('button',{name:'Сохранить свою процедуру'}).click();await page.waitForURL('**/#procedures/new-check');assert.equal(procedures.at(-1).kind,'check');assert.equal(procedures.at(-1).code,draftComment+'\n'+templates.check);
   await page.goto(`${url}/?run=bb22&tab=report`);await page.getByRole('heading',{name:'Журнал этапов'}).waitFor();assert.equal(await page.getByRole('link',{name:'Скачать HTML ↓'}).count(),0);assert(!requests.some(r=>r.p==='/runs/bb22/report'));
   await page.goto(`${url}/?run=aa11&tab=report`);await page.getByRole('heading',{name:'Какие атрибуты изменились'}).waitFor();await captureResponsive('report');
   // Exercise every primary screen at desktop and phone widths with the same explicit fixtures.
@@ -89,7 +124,14 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   ]){
    await page.goto(`${url}/${route}`);await page.getByRole('heading',{name:heading,exact:true}).waitFor();
    if(name==='procedures')await page.locator('.monaco-editor').waitFor();
-   await captureResponsive(name);
+   await assertTheme(false);await captureResponsive(name);
+   if(name==='runs'){
+    await setTheme(true);await captureResponsive('runs-dark');
+    await page.setViewportSize({width:390,height:844});await setTheme(false);await assertFitsViewport('runs-mobile-light');
+    await page.reload();await page.getByRole('heading',{name:'Запуски обработки',exact:true}).waitFor();await assertTheme(false);
+    await setTheme(true);await assertFitsViewport('runs-mobile-dark');await setTheme(false);
+    await page.setViewportSize({width:1440,height:1000});
+   }
   }
   // The mobile drawer announces its state and closes after navigation.
   await page.goto(`${url}/#runs`);await page.getByRole('heading',{name:'Запуски обработки',exact:true}).waitFor();
@@ -97,8 +139,14 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   const menuToggle=page.locator('.menu-toggle');assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');
   await menuToggle.click();assert.equal(await menuToggle.getAttribute('aria-expanded'),'true');await page.keyboard.press('Escape');assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');
   await menuToggle.click();assert.equal(await menuToggle.getAttribute('aria-expanded'),'true');await capture('navigation-mobile');
-  await page.locator('.nav-link').filter({hasText:'Датасеты'}).click();await page.getByRole('heading',{name:'Датасеты',exact:true}).waitFor();
+  await page.locator('.sidebar .nav-link').filter({hasText:'Датасеты'}).click();await page.getByRole('heading',{name:'Датасеты',exact:true}).waitFor();
   assert.equal(await menuToggle.getAttribute('aria-expanded'),'false');await assertFitsViewport('mobile navigation');
+  const account=page.getByRole('button',{name:'Аккаунт',exact:true});
+  await account.click();await page.getByRole('dialog',{name:'Аккаунт',exact:true}).waitFor();
+  assert.match(await page.getByRole('dialog',{name:'Аккаунт',exact:true}).innerText(),/analyst/);
+  await page.keyboard.press('Escape');assert.equal(await account.getAttribute('aria-expanded'),'false');
+  await account.click();await page.getByRole('button',{name:'Выйти',exact:true}).click();
+  await page.getByLabel('Имя пользователя').waitFor();await assertTheme(false);
   assert.deepEqual(errors,[]);
  }catch(error){await capture('failure');console.error('Browser errors:',errors,'Last requests:',requests.slice(-8),'Page:',(await page.locator('body').innerText()).slice(0,1500));throw error;}finally{await browser.close();await new Promise(resolve=>server.close(resolve));}
 });
