@@ -6,6 +6,3 @@
 *.pyc
 var/
 *.log
-
-
-/data/*
