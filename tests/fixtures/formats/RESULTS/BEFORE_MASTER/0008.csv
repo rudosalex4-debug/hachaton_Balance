@@ -1,0 +1,6 @@
+pointer,type,value
+/appData/application_id,string,0008
+/risk/score,number,0
+/risk/verified,boolean,false
+/risk/comment,null,
+/risk/label,string,"A, ""B"""

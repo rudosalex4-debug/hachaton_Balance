@@ -55,6 +55,7 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   else if(p==='/login'){authenticated=true;data={user:{username:'analyst'}};}
   else if(p==='/logout'){authenticated=false;data={};}
   else if(p==='/datasets')data={datasets:[{id:'ds1',name:'Исходный набор',applications:20,files:40,path:'/data/RUN'}]};
+  else if(p==='/datasets/upload')data={id:'mixed-input'};
   else if(p==='/defaults')data={settings};
   else if(p==='/procedure-templates')data=templates;
   else if(p==='/procedures'&&req.method()==='POST'){data={...body,id:'new-check',owner:'analyst'};procedures.push(data);}
@@ -66,6 +67,10 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   else if(p==='/runs/bb22')data={run:{...run,id:'bb22',status:'running',stage:'checking',progress:95}};
   else if(p.endsWith('/logs'))data={logs:[{created_at:run.created_at,stage:'checking',message:'Проверки выполняются',procedure_id:'c1'}]};
   else if(p==='/runs/aa11/report')data={run_id:run.id,summary:run.summary,checks,checks_summary:{total:3,pass:1,fail:2,low_confidence:1,checks:5}};
+  else if(p==='/runs/aa11/export'){
+   if(u.searchParams.get('artifact')==='checks'){await route.fulfill({status:403,json:{error:'Выгрузка недоступна'}});return;}
+   await route.fulfill({headers:{'Content-Type':'application/xml; charset=utf-8','Content-Disposition':'attachment; filename="comparisons.xml"'},body:'<rows/>'});return;
+  }
   else if(p==='/runs/aa11/report.html'){await route.continue();return;}
   else if(p==='/runs/aa11/checks'){const filtered=rows.filter(r=>(!u.searchParams.get('result')||r.RESULT===u.searchParams.get('result'))&&(!u.searchParams.get('confidence')||r.CONFIDENCE===u.searchParams.get('confidence'))&&(!u.searchParams.get('check_id')||r.check_id===u.searchParams.get('check_id')));data={items:filtered,total:filtered.length};}
   else if(p==='/runs/aa11/query'||p==='/runs/aa11/query/apps'){
@@ -94,6 +99,22 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
   assert.equal(await page.getByRole('button',{name:'Аккаунт',exact:true}).innerText(),'');
   assert.match(await page.locator('.metric').nth(3).innerText(),/3/);assert.equal(await page.locator('.checks-table .low-row').count(),1);
   const downloadPromise=page.waitForEvent('download');await page.getByRole('link',{name:'Скачать HTML ↓'}).click();const download=await downloadPromise;assert.match(download.suggestedFilename(),/\.html$/);assert.equal(await download.failure(),null);
+  await page.getByText('Выгрузить таблицу целиком',{exact:true}).click();
+  await page.getByLabel('Формат выгрузки').selectOption('xml');
+  const artifactPromise=page.waitForEvent('download');
+  await page.getByRole('button',{name:'Скачать таблицу',exact:true}).click();
+  const artifact=await artifactPromise;
+  assert.equal(artifact.suggestedFilename(),'balance-platform-aa11-comparisons.xml');
+  assert.equal(await artifact.failure(),null);
+  assert.equal(requests.filter(r=>r.p.endsWith('/export')).at(-1).query,'artifact=comparisons&format=xml');
+  await page.getByLabel('Таблица для выгрузки').selectOption('checks');
+  const rejectedDownloads=[];
+  const trackDownload=item=>rejectedDownloads.push(item);
+  page.on('download',trackDownload);
+  await page.getByRole('button',{name:'Скачать таблицу',exact:true}).click();
+  await page.getByRole('alert').filter({hasText:'Выгрузка недоступна'}).waitFor();
+  assert.equal(rejectedDownloads.length,0);
+  page.off('download',trackDownload);
   await page.getByRole('button',{name:'1 примеров ↗'}).first().click();await page.getByRole('region',{name:'Заявки проверки'}).waitFor();assert.match(await page.getByRole('region',{name:'Заявки проверки'}).innerText(),/не является полным/);await page.getByRole('link',{name:'I1001 ↗'}).click();await page.getByRole('cell',{name:'0.6 NUMBER',exact:true}).waitFor();
   await page.goto(`${url}/?run=aa11&tab=checks`);await page.getByLabel('Результат',{exact:true}).selectOption('PASS');await page.getByRole('button',{name:'Применить',exact:true}).click();await page.getByRole('cell',{name:'Стабильный продукт test3'}).waitFor();assert.equal(await page.locator('.checks-table tbody tr').count(),1);
   await page.goto(`${url}/?run=aa11&tab=pivot`);await page.getByRole('button',{name:'Заявки ячейки: 2',exact:true}).waitFor();assert.equal(await page.getByRole('button',{name:'Заявки ячейки: 4',exact:true}).count(),0);await page.getByRole('button',{name:'Заявки ячейки: 2',exact:true}).click();await page.getByRole('region',{name:'Заявки ячейки'}).waitFor();assert.equal(await page.getByRole('region',{name:'Заявки ячейки'}).locator('tbody tr').count(),2);
@@ -123,6 +144,23 @@ test('report, checks, pivot, configuration and stable-link browser flows', {time
    ['procedures','#procedures/new-check','Процедуры обработки']
   ]){
    await page.goto(`${url}/${route}`);await page.getByRole('heading',{name:heading,exact:true}).waitFor();
+   if(name==='datasets'){
+    const uploadFiles=[
+     {path:'mixed/manifest.json',content:'{"applications":2,"input_profiles":{"xml":{"root":"response"}}}'},
+     {path:'mixed/RESULTS/BEFORE_MASTER/A.json',content:'{"appData":{"application_id":"A"}}'},
+     {path:'mixed/RESULTS/AFTER_BETA/A.xml',content:'<response><appData><application_id>A</application_id></appData></response>'},
+     {path:'mixed/RESULTS/BEFORE_MASTER/B.csv',content:'pointer,type,value\n/appData/application_id,string,B'},
+     {path:'mixed/RESULTS/AFTER_BETA/B.csv',content:'pointer,type,value\n/appData/application_id,string,B'}
+    ];
+    await page.locator('input[webkitdirectory]').evaluate((input,rows)=>{
+     const transfer=new DataTransfer();
+     for(const row of rows){const file=new File([row.content],row.path.split('/').at(-1));Object.defineProperty(file,'webkitRelativePath',{value:row.path});transfer.items.add(file);}
+     input.files=transfer.files;input.dispatchEvent(new Event('change',{bubbles:true}));
+    },[...uploadFiles,{path:'mixed/summary.csv',content:'metric,count\nrows,2'}]);
+    await page.getByRole('button',{name:'Загрузить и проверить',exact:true}).click();
+    await page.getByRole('status').filter({hasText:'Набор загружен и проверен'}).waitFor();
+    assert.deepEqual(requests.filter(r=>r.p==='/datasets/upload').at(-1).body.files,uploadFiles);
+   }
    if(name==='procedures')await page.locator('.monaco-editor').waitFor();
    await assertTheme(false);await captureResponsive(name);
    if(name==='runs'){

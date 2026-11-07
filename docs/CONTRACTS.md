@@ -22,7 +22,7 @@ def compare(union_rows, config, emit): ...
 def aggregate(comparison_rows, union_rows, segments, config, emit): ...
 ```
 
-Каждая функция вызывает `emit(dict)` для каждой выходной записи и возвращает `None`. Нормализатор получает записи с APP_ID, SOURCE, raw и document; числа в document читаются с Decimal. Сравнение получает вертикальный union; начальные разрезы доступны через `config['application_segments']`. Для замены разрезов emit должен передать запись с `record_type: 'segment'`; вернуть нужно все заявки текущего пакета. Без таких записей сохраняются стандартные разрезы.
+Каждая функция вызывает `emit(dict)` для каждой выходной записи и возвращает `None`. Нормализатор получает `APP_ID`, `SOURCE`, текст JSON в `raw` и разобранный объект `document`. Для XML и CSV адаптер сначала формирует JSON по профилю из манифеста. Десятичные числа в `document` читаются с `Decimal`. Сравнение получает вертикальный union; начальные разрезы доступны через `config['application_segments']`. Для замены разрезов emit должен передать запись с `record_type: 'segment'`; вернуть нужно все заявки текущего пакета. Без таких записей сохраняются стандартные разрезы.
 
 В агрегаторе `comparison_rows` и `union_rows` — читаемые последовательности (`collections.abc.Sequence`) с ленивым чтением NDJSON. Поддерживаются `len()`, индексация (включая отрицательные индексы), срезы и повторный/вложенный обход. Это позволяет обработать полный набор в ограничении памяти без загрузки всех строк сразу. Каждое чтение возвращает отдельный словарь: изменения прочитанной строки не изменяют входную последовательность. Срез или явный `list(rows)` материализует выбранные строки и расходует память процедуры. `segments` остаётся списком. Контракты входных списков нормализатора и сравнения и формат `emit(dict)` не меняются.
 
@@ -41,7 +41,7 @@ def aggregate(comparison_rows, union_rows, segments, config, emit): ...
 | POST /register, /login; POST /logout; GET /me | Сессия пользователя |
 | GET /defaults | Стандартные настройки |
 | GET /datasets; POST /datasets | Список / регистрация `{name,path}` |
-| POST /datasets/upload | `{name,files:[{path,content}]}`, папка JSON, до 48 MiB содержимого |
+| POST /datasets/upload | `{name,files:[{path,content}]}`, манифест и ответы JSON/XML/CSV в UTF-8. До 48 MiB содержимого, до 8 MiB на файл |
 | GET /procedures; GET /procedure-templates | Процедуры и исходные Python-шаблоны |
 | POST /procedures; GET/PUT /procedures/{id} | Создание/чтение/изменение процедуры |
 | POST /configs; GET /configs; GET/PUT /configs/{id} | Сохранённые конфигурации |
@@ -55,7 +55,10 @@ def aggregate(comparison_rows, union_rows, segments, config, emit): ...
 | POST /runs/{id}/query/apps | Исходные заявки динамической группы |
 | GET /runs/{id}/checks | Общая таблица проверок, фильтры result/confidence/check_id |
 | GET /runs/{id}/report | Сводка прогона, числа PASS/FAIL/LOW, сведения о проверках и ссылки |
+| GET /runs/{id}/export?artifact={artifact}&format={format} | Полная таблица завершённого прогона. `artifact` принимает `normalized`, `comparisons`, `facts` или `checks`. Форматы `json`, `xml` и `csv` |
 | GET /runs/{id}/report.html | Самостоятельный HTML с полным набором строк проверок и ссылкой в приложение |
+
+При регистрации набора сервер применяет `manifest.input_profiles` ко всем ответам соответствующего расширения. Поле `input_contract` в описании набора содержит версию и профили преобразования. Поле `input_formats` содержит количество файлов каждого формата. Исходный и преобразованный ответ ограничены 8 MiB, набор на сервере — 512 MiB до и после преобразования. Примеры профилей и схемы выгрузок описаны в [руководстве по форматам](FORMATS.md).
 
 Страницы используют `offset` и `limit` (1–1000), возвращают `items`, `total`, `offset`, `limit`. Детали заявки возвращают `comparison`, `segment`, `total`, `offset`, `limit`. Фильтры диагностических данных: `app_id`, `path`, `array_key`, `source`, `diff_flag`, `change_type` (точное совпадение).
 

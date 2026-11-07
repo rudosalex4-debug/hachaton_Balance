@@ -1,0 +1,5 @@
+{
+  "appData": {"application_id": "0007"},
+  "risk": {"score": 42, "verified": true},
+  "decisionResult": {"product_trials": [{"product_id": "A", "product_name": "A & B"}]}
+}

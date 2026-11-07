@@ -37,7 +37,7 @@ PostgreSQL, загруженные наборы и очередь worker хра�
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y g++ cmake pkg-config libdrogon-dev libsimdjson-dev \
+sudo apt-get install -y g++ cmake pkg-config libdrogon-dev libxml2-dev libsimdjson-dev \
   libjsoncpp-dev libpqxx-dev libssl-dev libgtest-dev libsqlite3-dev libmariadb-dev libmariadb-dev-compat libbrotli-dev libhiredis-dev libyaml-cpp-dev python3 libseccomp2
 bash scripts/build-wsl.sh
 ```
@@ -66,7 +66,7 @@ backend/build-core/core_benchmark data/RUN-20260827-0001
 
 Этап 4 исполняет выбранные Python-проверки через контракт `CHECK` и индексированный `MartAPI`. Включены все пять скриптов из задания: падение Approval Rate продукта, новые/исчезнувшие атрибуты, изменение внешнего скора, исчезновение стоп-фактора, смена целевой модели. Код можно написать в Monaco либо загрузить из `.py`. Этап 5 предоставляет итоговый отчёт, сводную с изменяемой раскладкой и HTML-экспорт. Вычисление сводной использует сохранённую витрину и не запускает нормализацию повторно.
 
-Загрузка из браузера принимает каталог с JSON, не ZIP. Максимальный запрос — 64 MiB, суммарное содержимое JSON — 48 MiB; для более крупных наборов поместите папку в `data/` и зарегистрируйте `/data/имя-набора`. Имена файлов должны совпадать с `appData.application_id`; неполные пары, дубли и неверный JSON отклоняются.
+Загрузите папку с ответами СПР в UTF-8. Поддерживаются JSON, XML и CSV, в том числе разные форматы для двух срезов одной заявки. Предел загрузки через браузер — 48 MiB содержимого файлов и 64 MiB на HTTP-запрос. Более крупный набор можно поместить в `data/` и зарегистрировать через `/data/имя-набора`. Готовый пример для двух заявок, профили чтения и описание выгрузки таблиц приведены в [руководстве по форматам](docs/FORMATS.md).
 
 ## Проверки
 

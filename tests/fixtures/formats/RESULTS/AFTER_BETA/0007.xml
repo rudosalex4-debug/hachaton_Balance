@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<response>
+  <appData><id>0007</id></appData>
+  <risk><score>43</score><verified>true</verified></risk>
+  <decisionResult>
+    <product_trials><trial><product_id>A</product_id><product_name>A &amp; B</product_name></trial></product_trials>
+  </decisionResult>
+</response>

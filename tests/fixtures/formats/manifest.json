@@ -1,0 +1,11 @@
+{
+  "applications": 2,
+  "input_profiles": {
+    "xml": {
+      "root": "response",
+      "rename": {"/appData/id": "application_id"},
+      "types": {"/risk/score": "number", "/risk/verified": "boolean"},
+      "arrays": {"/decisionResult/product_trials": "trial"}
+    }
+  }
+}

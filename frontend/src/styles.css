@@ -503,3 +503,6 @@ html { scroll-padding-top: 120px; }
   .app-header .theme-toggle, .account-button { width: 32px; height: 34px; min-height: 34px; }
   .app-header .menu-toggle { width: 28px; }
 }
+
+.result-export > summary { cursor: pointer; padding: 12px 20px; font-weight: 600; }
+.result-export .toolbar { border-top: 1px solid var(--line); border-bottom: 0; }

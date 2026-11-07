@@ -2,6 +2,8 @@
 #include "core.hpp"
 #include "stage_executor.hpp"
 #include "reports.hpp"
+#include "input_formats.hpp"
+#include "export_http.hpp"
 #include <drogon/drogon.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -36,14 +38,115 @@ static std::string passwordHash(const std::string& p,const std::string& salt){un
 static std::string readFile(const fs::path& path,size_t max=8*1024*1024){if(fs::file_size(path)>max)throw std::runtime_error("Input file exceeds size limit: "+path.filename().string());std::ifstream f(path,std::ios::binary);if(!f)throw std::runtime_error("Cannot read "+path.string());std::ostringstream s;s<<f.rdbuf();return s.str();}
 static bool inside(const fs::path& child,const fs::path& parent){auto p=child.lexically_relative(parent);return !p.empty()&&!p.is_absolute()&&*p.begin()!="..";}
 struct Pair {std::string id,before,after;};
-static std::vector<Pair> inspectDataset(const std::string& path,const std::function<bool()>& cancelled=[] {return false;}){
- auto allowed=fs::weakly_canonical(env("DATA_ROOT","/data"));auto uploads=fs::weakly_canonical(env("UPLOAD_ROOT","/uploads"));auto root=fs::canonical(path);if(root!=allowed&&!inside(root,allowed)&&root!=uploads&&!inside(root,uploads))throw HttpError(400,"Dataset must be inside DATA_ROOT or UPLOAD_ROOT");
- auto manifestPath=fs::canonical(root/"manifest.json");if(!inside(manifestPath,root))throw HttpError(400,"Manifest escaped dataset directory");
- auto manifest=lens::decode(readFile(manifestPath));if(!manifest.isObject()||!manifest["applications"].isUInt())throw HttpError(400,"manifest.json requires applications");
- auto bd=fs::canonical(root/"RESULTS"/"BEFORE_MASTER"),ad=fs::canonical(root/"RESULTS"/"AFTER_BETA");if(!inside(bd,root)||!inside(ad,root))throw HttpError(400,"Dataset directories escaped root");
- std::map<std::string,fs::path> b,a;auto scan=[&](const fs::path& dir,auto& target){for(const auto& e:fs::directory_iterator(dir)){if(e.path().extension()!=".json")continue;if(!e.is_regular_file())throw HttpError(400,"Response is not a regular file");auto p=fs::canonical(e.path());if(!inside(p,root))throw HttpError(400,"Response escaped dataset directory");auto id=e.path().stem().string();if(id.empty()||id.size()>200||!target.emplace(id,p).second)throw HttpError(400,"Duplicate application identifier");}};scan(bd,b);scan(ad,a);
- if(b.empty()||b.size()!=a.size()||b.size()!=manifest["applications"].asUInt())throw HttpError(400,"Manifest count or BEFORE/AFTER pair count mismatch");if(b.size()>100000)throw HttpError(400,"Dataset exceeds 100000 applications");
- std::vector<Pair> pairs;size_t bytes=0;for(const auto& [id,p]:b){if(cancelled())throw std::runtime_error("Cancelled");auto it=a.find(id);if(it==a.end())throw HttpError(400,"Missing AFTER for "+id);auto before=readFile(p),after=readFile(it->second);bytes+=before.size()+after.size();if(bytes>512ULL*1024*1024)throw HttpError(400,"Dataset exceeds 512 MiB");for(const auto* raw:{&before,&after}){auto v=lens::decode(*raw);if(!v.isObject()||v["appData"]["application_id"].asString()!=id)throw HttpError(400,"Filename / application_id mismatch: "+id);}pairs.push_back({id,std::move(before),std::move(after)});}return pairs;
+
+struct DatasetInput {
+ std::vector<Pair> pairs;
+ Json::Value contract;
+ Json::Value formats{Json::objectValue};
+ std::string digest;
+};
+
+static Json::Value inputContract(const Json::Value& manifest) {
+ auto profiles = manifest.get("input_profiles", Json::Value(Json::objectValue));
+ if (!profiles.isObject()) throw HttpError(400, "manifest.input_profiles must be an object");
+ for (const auto& format : profiles.getMemberNames()) {
+  if (!lens::supportsInputFormat(format) || !profiles[format].isObject())
+   throw HttpError(400, "Invalid input profile for " + format);
+ }
+ Json::Value contract;
+ contract["version"] = 1;
+ contract["profiles"] = std::move(profiles);
+ return contract;
+}
+
+struct InputFile {
+ fs::path path;
+ std::string format;
+};
+
+static std::string fileFormat(const fs::path& path) {
+ auto extension = path.extension().string();
+ if (extension.empty()) return {};
+ auto format = extension.substr(1);
+ std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) {
+  return c >= 'A' && c <= 'Z' ? char(c + ('a' - 'A')) : char(c);
+ });
+ return format;
+}
+
+static std::map<std::string, InputFile> scanSide(const fs::path& root, const char* side) {
+ auto dir = fs::canonical(root / "RESULTS" / side);
+ if (!inside(dir, root)) throw HttpError(400, "Dataset directory escaped root");
+ std::map<std::string, InputFile> files;
+ for (const auto& entry : fs::directory_iterator(dir)) {
+  auto format = fileFormat(entry.path());
+  if (!lens::supportsInputFormat(format)) continue;
+  auto path = fs::canonical(entry.path());
+  if (!inside(path, root) || !entry.is_regular_file()) throw HttpError(400, "Invalid response file in " + std::string(side));
+  auto id = entry.path().stem().string();
+  if (id.empty() || id.size() > 200 || !files.emplace(id, InputFile{path, format}).second)
+   throw HttpError(400, std::string(side) + ": duplicate or invalid application identifier " + id);
+ }
+ return files;
+}
+
+static DatasetInput inspectDataset(const std::string& path, const std::function<bool()>& cancelled = [] { return false; }) {
+ auto root = fs::canonical(path);
+ auto allowed = fs::weakly_canonical(env("DATA_ROOT", "/data"));
+ auto uploads = fs::weakly_canonical(env("UPLOAD_ROOT", "/uploads"));
+ if (root != allowed && !inside(root, allowed) && root != uploads && !inside(root, uploads))
+  throw HttpError(400, "Dataset must be inside DATA_ROOT or UPLOAD_ROOT");
+ auto manifestPath = fs::canonical(root / "manifest.json");
+ if (!inside(manifestPath, root)) throw HttpError(400, "Manifest escaped dataset directory");
+ auto manifest = lens::decode(readFile(manifestPath));
+ if (!manifest.isObject() || !manifest["applications"].isUInt()) throw HttpError(400, "manifest.json requires applications");
+ auto before = scanSide(root, "BEFORE_MASTER");
+ auto after = scanSide(root, "AFTER_BETA");
+ if (before.empty() || before.size() != after.size() || before.size() != manifest["applications"].asUInt())
+  throw HttpError(400, "Manifest count or BEFORE/AFTER pair count mismatch");
+ if (before.size() > 100000) throw HttpError(400, "Dataset exceeds 100000 applications");
+
+ DatasetInput dataset;
+ dataset.contract = inputContract(manifest);
+ dataset.pairs.reserve(before.size());
+ const auto& profiles = static_cast<const Json::Value&>(dataset.contract)["profiles"];
+ std::string signatures, formatSequence;
+ size_t sourceBytes = 0, mappedBytes = 0;
+ auto readDocument = [&](const InputFile& file, const std::string& id) {
+  auto raw = readFile(file.path);
+  sourceBytes += raw.size();
+  if (sourceBytes > 512ULL * 1024 * 1024) throw HttpError(400, "Dataset exceeds 512 MiB");
+  signatures += ":" + hash(raw);
+  formatSequence += file.format + "\n";
+  auto& count = dataset.formats[file.format];
+  count = count.asUInt() + 1;
+  try {
+   auto document = lens::readInputDocument(file.format, raw, profiles.get(file.format, Json::Value(Json::objectValue)));
+   mappedBytes += document.size();
+   if (document.size() > 8ULL * 1024 * 1024 || mappedBytes > 512ULL * 1024 * 1024)
+    throw std::runtime_error("Mapped document or dataset exceeds size limit");
+   const auto value = lens::decode(document);
+   if (!value.isObject() || value["appData"]["application_id"].asString() != id)
+    throw std::runtime_error("Filename / application_id mismatch: " + id);
+   return document;
+  } catch (const std::exception& error) {
+   throw HttpError(400, file.path.lexically_relative(root).generic_string() + ": " + error.what());
+  }
+ };
+ for (const auto& [id, file] : before) {
+  if (cancelled()) throw std::runtime_error("Cancelled");
+  auto match = after.find(id);
+  if (match == after.end()) throw HttpError(400, "Missing AFTER for " + id);
+  signatures += id;
+  auto first = readDocument(file, id);
+  auto second = readDocument(match->second, id);
+  signatures += "\n";
+  dataset.pairs.push_back({id, std::move(first), std::move(second)});
+ }
+ if (!profiles.empty() || dataset.formats.size() != 1 || !dataset.formats.isMember("json"))
+  signatures += lens::encode(dataset.contract) + "\n" + formatSequence;
+ dataset.digest = hash(signatures);
+ return dataset;
 }
 static Json::Value array(){return Json::Value(Json::arrayValue);}
 static void extend(Json::Value& a,const Json::Value& b){for(const auto& v:b)a.append(v);}
@@ -57,8 +160,22 @@ class Jobs {
   auto state=[&](const std::string& stage,int progress){check();Json::Value p;p["status"]="running";p["stage"]=stage;p["progress"]=progress;p["elapsed_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();db_.patchRun(id,p);};
   auto invoke=[&](const std::string& kind,const Json::Value& input){auto proc=procedures[kind];return lens::executePython(kind,proc["code"].asString(),input,stageConfig(settings,proc),cancelled,[&](const std::string& line){db_.log(id,kind,line,0,0,proc["id"].asString());});};
   try{
-   state("validating",0);db_.log(id,"validating","Validating manifest, pairs, JSON and application identifiers");auto pairs=inspectDataset(run["snapshot"]["dataset"]["path"].asString(),cancelled);phase("read_seconds");db_.log(id,"validating","Dataset validated",pairs.size(),pairs.size());
-   std::string datasetHash;for(const auto& pair:pairs)datasetHash+=pair.id+":"+hash(pair.before)+":"+hash(pair.after)+"\n";Json::Value fingerprint;fingerprint["dataset_sha256"]=hash(datasetHash);fingerprint["started_at"]=lens::timestamp();db_.patchRun(id,fingerprint);Json::Value segs=array();if(procedures["normalize"]["mode"].asString()!="native")for(const auto& p:pairs)segs.append(lens::segments(p.before,p.after,p.id,settings));phase("segments_seconds");
+   state("validating",0);
+   db_.log(id,"validating","Validating manifest, input documents and application identifiers");
+   const auto& registered = run["snapshot"]["dataset"];
+   auto input = inspectDataset(registered["path"].asString(), cancelled);
+   if (registered.isMember("input_contract") && registered["input_contract"] != input.contract)
+    throw std::runtime_error("Input profile changed after registration; register the updated dataset");
+   auto& pairs = input.pairs;
+   Json::Value fingerprint;
+   fingerprint["dataset_sha256"] = input.digest;
+   fingerprint["input_contract"] = input.contract;
+   fingerprint["input_formats"] = input.formats;
+   fingerprint["started_at"] = lens::timestamp();
+   db_.patchRun(id, fingerprint);
+   phase("read_seconds");
+   db_.log(id,"validating","Dataset validated",pairs.size(),pairs.size());
+   Json::Value segs=array();if(procedures["normalize"]["mode"].asString()!="native")for(const auto& p:pairs)segs.append(lens::segments(p.before,p.after,p.id,settings));phase("segments_seconds");
    state("normalizing",5);db_.log(id,"normalizing","Normalization started",0,pairs.size(),procedures["normalize"]["id"].asString());long normalizedCount=0;constexpr size_t batchSize=100;
    for(size_t begin=0;begin<pairs.size();begin+=batchSize){check();Json::Value rows=array();size_t end=std::min(begin+batchSize,pairs.size());std::set<std::string> appIds;
     if(procedures["normalize"]["mode"].asString()=="native"){for(size_t i=begin;i<end;++i){auto& p=pairs[i];auto before=lens::normalize(p.before,p.id,"BEFORE",settings),after=lens::normalize(p.after,p.id,"AFTER",settings);auto segmentStart=std::chrono::steady_clock::now();segs.append(lens::segmentsFromNormalized(before,after,p.id));segmentSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-segmentStart).count();for(auto& row:before)rows.append(std::move(row));for(auto& row:after)rows.append(std::move(row));appIds.insert(p.id);}}
@@ -103,18 +220,19 @@ class Api {
   route("/api/v1/(datasets|procedures|configs|runs)",{drogon::Get},[&](auto req,auto cb,auto args){Json::Value out;out[args[0]]=db_.list(args[0],user(req));respond(cb,out);});
   route("/api/v1/procedure-templates",{drogon::Get},[&](auto req,auto cb,auto){user(req);Json::Value out;for(auto kind:{"normalize","compare","aggregate","check"})out[kind]=readFile(fs::path(env("PROCEDURES_ROOT","/app/python-worker/procedures"))/(std::string(kind)+".py"));respond(cb,out);});
   route("/api/v1/datasets/upload",{drogon::Post},[&](auto req,auto cb,auto){
-   auto name=user(req);auto v=body(req);if(!v["files"].isArray()||v["files"].empty()||v["files"].size()>10001)throw HttpError(400,"Upload requires 1..10001 JSON files");
+   auto name=user(req);auto v=body(req);if(!v["files"].isArray()||v["files"].empty()||v["files"].size()>10001)throw HttpError(400,"Upload requires 1..10001 dataset files");
    auto root=fs::path(env("UPLOAD_ROOT","/uploads"));fs::create_directories(root);root=fs::canonical(root);auto id=randomId();auto dest=root/id;fs::create_directory(dest);
    try{std::set<std::string> seen;size_t bytes=0;std::string prefix;bool direct=false;for(const auto& file:v["files"])if(file["path"].asString()=="manifest.json")direct=true;
     if(!direct){for(const auto& file:v["files"]){auto path=file["path"].asString();auto slash=path.find('/');if(slash!=std::string::npos&&path.substr(slash+1)=="manifest.json"){prefix=path.substr(0,slash+1);break;}}if(prefix.empty())throw HttpError(400,"Select a dataset folder containing manifest.json");}
     for(const auto& file:v["files"]){if(!file["path"].isString()||!file["content"].isString())throw HttpError(400,"Each file requires path and content strings");auto name=file["path"].asString();if(!prefix.empty()){if(name.rfind(prefix,0)!=0)throw HttpError(400,"All files must belong to one dataset folder");name=name.substr(prefix.size());}
-     if(name!="manifest.json"&&!std::regex_match(name,std::regex("RESULTS/(BEFORE_MASTER|AFTER_BETA)/[A-Za-z0-9_-]{1,200}\\.json")))throw HttpError(400,"Unsupported upload path: "+name);
+     static const std::regex uploadPath("RESULTS/(BEFORE_MASTER|AFTER_BETA)/[A-Za-z0-9_-]{1,200}\\.[A-Za-z0-9]+");
+     if(name!="manifest.json"&&(!std::regex_match(name,uploadPath)||!lens::supportsInputFormat(fileFormat(name))))throw HttpError(400,"Unsupported upload path: "+name);
      if(!seen.insert(name).second)throw HttpError(400,"Duplicate upload path");auto content=file["content"].asString();bytes+=content.size();if(content.size()>8*1024*1024||bytes>48*1024*1024)throw HttpError(413,"Dataset upload exceeds size limit (48 MiB total, 8 MiB per file)");auto path=dest/fs::path(name);fs::create_directories(path.parent_path());std::ofstream out(path,std::ios::binary);out<<content;if(!out)throw std::runtime_error("Cannot write uploaded dataset");
     }
-    auto pairs=inspectDataset(dest.string());Json::Value out;out["id"]=id;out["name"]=v.get("name",prefix.empty()?id:prefix.substr(0,prefix.size()-1));out["path"]=dest.string();out["applications"]=Json::UInt64(pairs.size());out["files"]=Json::UInt64(pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();out["validation"]= "valid";db_.save("datasets",out,name);respond(cb,out,201);
+    auto input=inspectDataset(dest.string());Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=id;out["name"]=v.get("name",prefix.empty()?id:prefix.substr(0,prefix.size()-1));out["path"]=dest.string();out["applications"]=Json::UInt64(input.pairs.size());out["files"]=Json::UInt64(input.pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();out["validation"]= "valid";db_.save("datasets",out,name);respond(cb,out,201);
    }catch(...){fs::remove_all(dest);throw;}
   });
-  route("/api/v1/datasets",{drogon::Post},[&](auto req,auto cb,auto){auto name=user(req);auto v=body(req);auto path=fs::canonical(v["path"].asString()).string();auto dataRoot=fs::weakly_canonical(env("DATA_ROOT","/data"));auto candidate=fs::path(path);if(candidate!=dataRoot&&!inside(candidate,dataRoot))throw HttpError(400,"Register server datasets under DATA_ROOT; use upload for local files");auto pairs=inspectDataset(path);Json::Value out;out["id"]=randomId();out["name"]=v.get("name",fs::path(path).filename().string());out["path"]=path;out["applications"]=Json::UInt64(pairs.size());out["files"]=Json::UInt64(pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();db_.save("datasets",out,name);respond(cb,out,201);});
+  route("/api/v1/datasets",{drogon::Post},[&](auto req,auto cb,auto){auto name=user(req);auto v=body(req);auto path=fs::canonical(v["path"].asString()).string();auto dataRoot=fs::weakly_canonical(env("DATA_ROOT","/data"));auto candidate=fs::path(path);if(candidate!=dataRoot&&!inside(candidate,dataRoot))throw HttpError(400,"Register server datasets under DATA_ROOT; use upload for local files");auto input=inspectDataset(path);Json::Value out;out["input_contract"]=input.contract;out["input_formats"]=input.formats;out["id"]=randomId();out["name"]=v.get("name",fs::path(path).filename().string());out["path"]=path;out["applications"]=Json::UInt64(input.pairs.size());out["files"]=Json::UInt64(input.pairs.size()*2);out["owner"]=name;out["created_at"]=lens::timestamp();db_.save("datasets",out,name);respond(cb,out,201);});
   route("/api/v1/procedures(?:/([a-f0-9]+))?",{drogon::Post,drogon::Put},[&](auto req,auto cb,auto args){auto name=user(req);auto v=body(req);std::string id=args.empty()||args[0].empty()?randomId():args[0];if((req->method()==drogon::Put)&&(args.empty()||args[0].empty()))throw HttpError(400,"Procedure id required");if(req->method()==drogon::Put)db_.get("procedures",id,name);auto kind=v["kind"].asString();if(kind!="normalize"&&kind!="compare"&&kind!="aggregate"&&kind!="check")throw HttpError(400,"Unknown procedure kind");if(!v["code"].isString()||v["code"].asString().empty()||v["code"].asString().size()>1024*1024)throw HttpError(400,"Python source required, maximum 1 MiB");Json::Value validation;validation["procedure_kind"]=kind;validation["worker_timeout_seconds"]=15;auto validationResult=lens::executePython("validate",v["code"].asString(),Json::Value(Json::objectValue),validation,[]{return false;},[](const std::string&){});if(kind=="check"){if(validationResult.size()!=1||!validationResult[0]["params"].isObject())throw HttpError(400,"Invalid CHECK metadata");auto defaults=validationResult[0]["params"];if(v["params"].isObject())for(auto it=v["params"].begin();it!=v["params"].end();++it)defaults[it.name()]=*it;v["params"]=defaults;v["check_source_id"]=validationResult[0]["id"];if(!v["name"].isString()||v["name"].asString().empty())v["name"]=validationResult[0]["label"];}v["id"]=id;v["owner"]=name;v["mode"]="python";v["source"]=v.get("source","workspace");if(v["source"]!="workspace"&&v["source"]!="file")throw HttpError(400,"Source must be workspace or file");if(!v["params"].isObject())v["params"]=Json::Value(Json::objectValue);v["sha256"]=hash(v["code"].asString());v["created_at"]=lens::timestamp();db_.save("procedures",v,name);respond(cb,v,req->method()==drogon::Put?200:201);});
   route("/api/v1/configs(?:/([a-f0-9]+))?",{drogon::Post,drogon::Put},[&](auto req,auto cb,auto args){auto name=user(req);auto id=args.empty()||args[0].empty()?randomId():args[0];if((req->method()==drogon::Put)&&(args.empty()||args[0].empty()))throw HttpError(400,"Configuration id required");if(req->method()==drogon::Put)db_.get("configs",id,name);auto v=config(body(req),name,id);db_.save("configs",v,name);respond(cb,v,req->method()==drogon::Put?200:201);});
   route("/api/v1/(configs|procedures)/([a-zA-Z0-9_-]+)",{drogon::Get},[&](auto req,auto cb,auto args){respond(cb,db_.get(args[0],args[1],user(req)));});
@@ -129,6 +247,11 @@ class Api {
   route("/api/v1/runs/([a-f0-9]+)/checks",{drogon::Get},[&](auto req,auto cb,auto args){auto run=db_.get("runs",args[0],user(req));if(run["status"]!="completed")throw HttpError(409,"Results are available only after completion");std::map<std::string,std::string> filters;for(auto key:{"result","confidence","check_id"}){auto value=req->getParameter(key);if(!value.empty())filters[key]=value;}respond(cb,db_.checkPage(args[0],filters,number(req,"offset",0,100000000),std::max(1,number(req,"limit",100,1000))));});
   route("/api/v1/runs/([a-f0-9]+)/report",{drogon::Get},[&](auto req,auto cb,auto args){auto run=db_.get("runs",args[0],user(req));if(run["status"]!="completed")throw HttpError(409,"Report is available only after completion");respond(cb,report(run));});
   route("/api/v1/runs/([a-f0-9]+)/report\\.html",{drogon::Get},[&](auto req,auto cb,auto args){auto run=db_.get("runs",args[0],user(req));if(run["status"]!="completed")throw HttpError(409,"Report is available only after completion");auto result=report(run);auto rows=db_.checkPage(args[0],{},0,100000)["items"];auto response=drogon::HttpResponse::newHttpResponse();response->setContentTypeCode(drogon::CT_TEXT_HTML);response->setBody(lens::renderReportHtml(result,rows,applicationBase(req)));response->addHeader("Cache-Control","no-store");response->addHeader("X-Content-Type-Options","nosniff");response->addHeader("Content-Security-Policy","default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'");if(req->getParameter("download")!="0")response->addHeader("Content-Disposition","attachment; filename=balance-platform-"+args[0]+".html");cb(response);});
+  route("/api/v1/runs/([a-f0-9]+)/export", {drogon::Get}, [this](auto req, auto cb, auto args) {
+   const auto run = db_.get("runs", args[0], user(req));
+   if (run["status"] != "completed") throw HttpError(409, "Results are available only after completion");
+   cb(lens::makeExportResponse(db_, args[0], req->getParameter("artifact"), req->getParameter("format")));
+  });
   route("/health",{drogon::Get},[&](auto,auto cb,auto){auto c=db_.connection();pqxx::read_transaction tx(*c);tx.exec("SELECT 1");Json::Value out;out["status"]="ok";respond(cb,out);});
  }
 };
@@ -136,5 +259,5 @@ class Api {
 int main(){try{Storage db(env("DATABASE_URL","postgresql://lens:lens@postgres:5432/lens"));db.initialize(env("MIGRATIONS_PATH","/app/database/migrations/001_init.sql"));for(auto kind:{"normalize","compare","aggregate"}){Json::Value p;p["id"]=kind;p["name"]=std::string("C++20 · ")+kind;p["kind"]=kind;p["mode"]="native";p["source"]="native";p["code"]="Native C++ implementation: backend/src/core.cpp";auto code=fs::path("/app/native/core.cpp");if(fs::exists(code))p["code"]=readFile(code);p["sha256"]=hash(p["code"].asString());p["params"]=Json::Value(Json::objectValue);db.save("procedures",p,"");}
  for(auto kind:{"normalize","compare","aggregate"}){auto file=fs::path(env("PROCEDURES_ROOT","/app/python-worker/procedures"))/(std::string(kind)+".py");if(fs::exists(file)){Json::Value p;p["id"]=std::string("python-")+kind;p["name"]=std::string("Python · ")+kind;p["kind"]=kind;p["mode"]="python";p["source"]="file";p["code"]=readFile(file);p["sha256"]=hash(p["code"].asString());p["params"]=Json::Value(Json::objectValue);db.save("procedures",p,"");}}
  auto checksRoot=fs::path(env("CHECKS_ROOT","/app/python-worker/checks"));auto catalogPath=checksRoot/"catalog.json";if(fs::exists(catalogPath)){auto catalog=lens::decode(readFile(catalogPath));for(const auto& item:catalog){auto filename=item["file"].asString();if(!std::regex_match(filename,std::regex("check_[a-z0-9_]+\\.py")))throw std::runtime_error("Invalid bundled check filename");Json::Value procedure;procedure["id"]=fs::path(filename).stem().string();procedure["kind"]="check";procedure["mode"]="python";procedure["source"]="file";procedure["name"]=item["label"];procedure["params"]=item["params"];procedure["code"]=readFile(checksRoot/filename);procedure["sha256"]=hash(procedure["code"].asString());db.save("procedures",procedure,"");}}
- auto data=fs::path(env("DATA_ROOT","/data"));if(fs::exists(data))for(auto& e:fs::directory_iterator(data)){if(!e.is_directory()||!fs::exists(e.path()/"manifest.json"))continue;try{auto manifest=lens::decode(readFile(e.path()/"manifest.json"));Json::Value d;d["id"]="builtin-"+e.path().filename().string();d["name"]=e.path().filename().string();d["path"]=fs::canonical(e.path()).string();d["applications"]=manifest["applications"];d["files"]=manifest["applications"].asUInt()*2;db.save("datasets",d,"");}catch(const std::exception& error){LOG_ERROR<<"Dataset discovery: "<<error.what();}}
+ auto data=fs::path(env("DATA_ROOT","/data"));if(fs::exists(data))for(auto& e:fs::directory_iterator(data)){if(!e.is_directory()||!fs::exists(e.path()/"manifest.json"))continue;try{auto manifest=lens::decode(readFile(e.path()/"manifest.json"));Json::Value d;d["id"]="builtin-"+e.path().filename().string();d["name"]=e.path().filename().string();d["path"]=fs::canonical(e.path()).string();d["applications"]=manifest["applications"];d["input_contract"]=inputContract(manifest);d["files"]=manifest["applications"].asUInt()*2;db.save("datasets",d,"");}catch(const std::exception& error){LOG_ERROR<<"Dataset discovery: "<<error.what();}}
  Jobs jobs(db);Api api(db,jobs);drogon::app().setThreadNum(4).setClientMaxBodySize(64*1024*1024).addListener("0.0.0.0",8080).run();return 0;}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}}
